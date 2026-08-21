@@ -19,7 +19,8 @@ export async function handleTurnstileVerification(
   request: Request, 
   env: Env, 
   modeOverride?: 'strict' | 'relaxed' | 'off' | null,
-  mismatchIp?: boolean
+  mismatchIp?: boolean,
+  action?: string
 ): Promise<Response> {
   try {
     const formData = await request.formData();
@@ -58,6 +59,7 @@ export async function handleTurnstileVerification(
 
     // Handle IP mismatch detection (double-call succeeded on retry with 'off')
     if (ipMismatchDetected && secondCallResult) {
+      const shouldBlock = action === 'block';
       const warningHtml = `
 <!DOCTYPE html>
 <html>
@@ -142,12 +144,30 @@ export async function handleTurnstileVerification(
       • <strong>This is the IP mismatch pattern</strong> — you detected it using the double-call workaround
     </div>
 
-    <h3>Decision Point</h3>
-    <p>Token is valid but IP didn't match ${mode} policy. Options:</p>
+    <h3>Action Taken: ${shouldBlock ? '🚫 Hard Block' : '✅ Allow + Flag'}</h3>
+    ${shouldBlock ? `
+    <div style="background: #f8d7da; border-left: 4px solid #dc3545; padding: 15px; margin: 15px 0;">
+      <strong>Request BLOCKED</strong><br>
+      • IP mismatch detected → rejecting request (HTTP 401)<br>
+      • User sees immediate failure<br>
+      • ⚠️ <strong>Attacker knows they were detected</strong><br>
+      • Use case: High-security scenarios where false positives are acceptable
+    </div>
+    ` : `
+    <div style="background: #d4edda; border-left: 4px solid #28a745; padding: 15px; margin: 15px 0;">
+      <strong>Request ALLOWED + FLAGGED</strong><br>
+      • IP mismatch detected but allowing request (HTTP 200)<br>
+      • Session/account flagged for review<br>
+      • ✓ <strong>Attacker doesn't know they're being tracked</strong> (shadow ban)<br>
+      • Use case: Gather intel, avoid false positive friction
+    </div>
+    `}
+
+    <p><strong>Other options you could implement:</strong></p>
     <ul>
-      <li><strong>Allow + Flag:</strong> Let user through but log for review (this demo allows)</li>
-      <li><strong>Hard Block:</strong> Reject as suspicious (attacker knows they're detected)</li>
-      <li><strong>Step-Up Auth:</strong> Require additional verification (MFA, email code, etc.)</li>
+      <li><strong>Step-Up Auth:</strong> Require MFA, email code, or CAPTCHA</li>
+      <li><strong>Rate Limit:</strong> Increase friction without blocking</li>
+      <li><strong>Conditional Block:</strong> Block based on risk score, user history, etc.</li>
     </ul>
 
     <details>
@@ -163,6 +183,7 @@ export async function handleTurnstileVerification(
 </body>
 </html>`;
       return new Response(warningHtml, {
+        status: shouldBlock ? 401 : 200,
         headers: { 'Content-Type': 'text/html; charset=utf-8' }
       });
     }
@@ -405,6 +426,7 @@ return { allow: false, error: result1["error-codes"] };</pre>
     if (url.pathname === '/form' && request.method === 'GET') {
       const mode = url.searchParams.get('mode') || env.REMOTEIP_LENIENCY || 'strict';
       const mismatchIp = url.searchParams.get('mismatch') === 'true';
+      const action = url.searchParams.get('action') || 'allow';
       const formHtml = `
 <!DOCTYPE html>
 <html>
@@ -448,37 +470,49 @@ return { allow: false, error: result1["error-codes"] };</pre>
       </label>
     </div>
 
+    <div class="test-toggle">
+      <strong>Action on IP Mismatch Detection:</strong><br><br>
+      <label><input type="radio" name="action" value="allow" ${action === 'allow' ? 'checked' : ''} onchange="updateAction()"> Allow + Flag (shadow ban - attacker doesn't know)</label><br>
+      <label><input type="radio" name="action" value="block" ${action === 'block' ? 'checked' : ''} onchange="updateAction()"> Hard Block (reject - attacker knows immediately)</label>
+    </div>
+
     ${mismatchIp ? '<div class="warning"><strong>⚠️ IP Mismatch Mode:</strong> Will send 192.0.2.1 instead of your real IP to trigger validation failure. Use this to see how each mode handles mismatches.</div>' : ''}
 
     <div class="info" style="background: #e7f3ff; border-left-color: #0066cc; font-size: 14px;">
       <strong>What happens when you submit:</strong><br>
       ${mode !== 'off' ? `
         1️⃣ First call: siteverify with <code>remoteip_leniency="${mode}"</code><br>
-        2️⃣ If it fails with <code>invalid-input-response</code>, automatic retry with <code>remoteip_leniency="off"</code><br>
-        3️⃣ If retry succeeds → <strong>IP mismatch detected</strong> (you'll see the double-call timeline)<br>
-        4️⃣ If retry fails → token invalid for other reason
+        2️⃣ If first call fails with <code>invalid-input-response</code> → automatic retry with <code>remoteip_leniency="off"</code><br>
+        3️⃣ If retry succeeds → <strong>IP mismatch detected!</strong> (you'll see the double-call timeline)<br>
+        4️⃣ If retry also fails → token invalid for other reason (expired/reused/malformed)
       ` : `
         • Single call: siteverify with <code>remoteip_leniency="off"</code><br>
-        • No double-call (IP enforcement disabled)
+        • No double-call needed (IP enforcement already disabled)
       `}
     </div>
 
     <p>Complete the challenge and submit:</p>
-    <form method="POST" action="/form?mode=${mode}${mismatchIp ? '&mismatch=true' : ''}">
+    <form method="POST" action="/form?mode=${mode}${mismatchIp ? '&mismatch=true' : ''}${action ? '&action=' + action : ''}">
       <div class="cf-turnstile" data-sitekey="${env.TURNSTILE_SITE_KEY}"></div>
       <br>
       <input type="submit" value="Verify Token">
     </form>
   </div>
   <script>
-    function updateMode(mode) {
+    function buildUrl() {
+      const mode = document.querySelector('input[name="mode"]:checked').value;
       const mismatch = document.getElementById('mismatch').checked;
-      location.href = '/form?mode=' + mode + (mismatch ? '&mismatch=true' : '');
+      const action = document.querySelector('input[name="action"]:checked').value;
+      return '/form?mode=' + mode + (mismatch ? '&mismatch=true' : '') + '&action=' + action;
+    }
+    function updateMode(mode) {
+      location.href = buildUrl();
     }
     function updateMismatch() {
-      const mismatch = document.getElementById('mismatch').checked;
-      const mode = document.querySelector('input[name="mode"]:checked').value;
-      location.href = '/form?mode=' + mode + (mismatch ? '&mismatch=true' : '');
+      location.href = buildUrl();
+    }
+    function updateAction() {
+      location.href = buildUrl();
     }
   </script>
 </body>
@@ -493,7 +527,8 @@ return { allow: false, error: result1["error-codes"] };</pre>
     if (request.method === 'POST') {
       const mode = url.searchParams.get('mode') as 'strict' | 'relaxed' | 'off' | null;
       const mismatchIp = url.searchParams.get('mismatch') === 'true';
-      return handleTurnstileVerification(request, env, mode, mismatchIp);
+      const action = url.searchParams.get('action') || 'allow';
+      return handleTurnstileVerification(request, env, mode, mismatchIp, action);
     }
 
     return new Response('Method not allowed', { status: 405 });
