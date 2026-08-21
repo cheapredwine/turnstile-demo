@@ -204,13 +204,19 @@ export async function handleTurnstileVerification(
     <div class="conclusion">
       <strong>🔍 Conclusion:</strong><br>
       ${relaxedResult?.success ? `
-        • <strong>Strict blocked, relaxed passed</strong><br>
+        • <strong>2-call pattern: Strict blocked, relaxed passed</strong><br>
         • IP mismatch level: Same ASN + same subnet, but different exact IP (or IPv4↔IPv6 cross-family, or private remote IP)<br>
+        • Real IP: ${realClientIp}<br>
+        • Sent IP: ${clientIp} ${mismatchDescription ? `(${mismatchDescription})` : ''}<br>
+        • Result: Cloudflare's ASN database considers these IPs in the same ASN + subnet<br>
         • Would be blocked by: strict mode only<br>
         • Would pass: relaxed and off modes
       ` : offResult?.success ? `
-        • <strong>Both strict AND relaxed blocked, only off passed</strong><br>
+        • <strong>3-call pattern: Both strict AND relaxed blocked, only off passed</strong><br>
         • IP mismatch level: Different ASN, or same ASN + different subnet (IPv4 /24, IPv6 /64)<br>
+        • Real IP: ${realClientIp}<br>
+        • Sent IP: ${clientIp} ${mismatchDescription ? `(${mismatchDescription})` : ''}<br>
+        ${mismatchDescription === 'SAME SUBNET' ? `• Note: Despite being in same /24, Cloudflare's ASN database treats these as different ASNs (fragmented IP block assignment)<br>` : ''}
         • Would be blocked by: both strict and relaxed modes<br>
         • Would pass: off mode only
       ` : ''}
@@ -579,11 +585,11 @@ Result: Both blocked (3 calls made)
 
     ${mismatchType === 'subnet' ? `<div class="warning" style="background: #fff3cd;">
       <strong>⚠️ Same Subnet Mismatch Mode</strong><br>
-      Sending (your IP + 1) instead of your real IP.<br><br>
-      <strong>Expected Result:</strong> 2 calls (strict → relaxed)<br>
+      Your real IP will be shown below. We'll send (last octet + 1) to siteverify.<br><br>
+      <strong>Expected Result:</strong> 2 calls if IPs share same ASN<br>
       • Call #1 (strict): FAIL - different exact IP<br>
-      • Call #2 (relaxed): SUCCESS - same subnet + likely same ASN ✓<br><br>
-      <strong>Note:</strong> Assumes +1 is in same /24 subnet and same ISP (usually true for residential IPs).
+      • Call #2 (relaxed): SUCCESS ✓ - same /24 + same ASN<br><br>
+      <strong>If you see 3 calls:</strong> IP+1 is in a different ASN in Cloudflare's database (fragmented IP blocks). Try "Different ASN" option instead to see the 3-call pattern clearly.
     </div>` : ''}
     ${mismatchType === 'asn' ? `<div class="warning" style="background: #ffe4e1;">
       <strong>⚠️ Different ASN Mismatch Mode</strong><br>
