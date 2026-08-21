@@ -6,6 +6,13 @@ interface TurnstileVerifyResponse {
   challenge_ts?: string;
   hostname?: string;
   "remoteip_leniency"?: string;
+  ip_comparison_metadata?: {
+    matched?: boolean;
+    original_ip?: string;
+    verification_ip?: string;
+    comparison_method?: string;
+    [key: string]: any;
+  };
 }
 
 interface Env {
@@ -15,7 +22,11 @@ interface Env {
   TURNSTILE_CACHE?: KVNamespace;
 }
 
-export async function handleTurnstileVerification(request: Request, env: Env): Promise<Response> {
+export async function handleTurnstileVerification(
+  request: Request, 
+  env: Env, 
+  modeOverride?: 'strict' | 'relaxed' | 'off' | null
+): Promise<Response> {
   try {
     const formData = await request.formData();
     const token = formData.get('cf-turnstile-response') as string;
@@ -25,7 +36,7 @@ export async function handleTurnstileVerification(request: Request, env: Env): P
       return new Response('No Turnstile token provided', { status: 400 });
     }
 
-    const verificationResult = await verifyTurnstileToken(token, clientIp, env);
+    const verificationResult = await verifyTurnstileToken(token, clientIp, env, modeOverride || undefined);
 
     if (!verificationResult.success) {
       const errorHtml = `
@@ -75,10 +86,11 @@ export async function handleTurnstileVerification(request: Request, env: Env): P
   <div class="success">
     <h2>✅ Turnstile Verification Successful</h2>
     <div class="result">
-      <div><span class="label">Mode:</span> ${env.REMOTEIP_LENIENCY || 'strict'}</div>
+      <div><span class="label">Mode Used:</span> ${modeOverride || env.REMOTEIP_LENIENCY || 'strict'}</div>
       <div><span class="label">Client IP:</span> ${clientIp}</div>
       <div><span class="label">Challenge TS:</span> ${verificationResult.challenge_ts || 'N/A'}</div>
       <div><span class="label">Hostname:</span> ${verificationResult.hostname || 'N/A'}</div>
+      ${verificationResult.ip_comparison_metadata ? `<div><span class="label">IP Comparison:</span> ${JSON.stringify(verificationResult.ip_comparison_metadata)}</div>` : ''}
     </div>
     <details>
       <summary style="cursor: pointer; color: #0056b3;">Full API Response</summary>
@@ -191,12 +203,12 @@ const result = await fetch(
     }
 
     if (url.pathname === '/form' && request.method === 'GET') {
-      const leniencyMode = env.REMOTEIP_LENIENCY || 'strict';
+      const mode = url.searchParams.get('mode') || env.REMOTEIP_LENIENCY || 'strict';
       const formHtml = `
 <!DOCTYPE html>
 <html>
 <head>
-  <title>Turnstile Demo - remoteip_leniency: ${leniencyMode}</title>
+  <title>Turnstile Demo - remoteip_leniency: ${mode}</title>
   <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
   <style>
     body { font-family: Arial, sans-serif; max-width: 600px; margin: 50px auto; padding: 20px; }
@@ -205,17 +217,28 @@ const result = await fetch(
     input[type="submit"]:hover { background: #004494; }
     .cf-turnstile { margin: 20px 0; }
     .info { background: #f0f8ff; padding: 10px; margin-bottom: 20px; border-left: 4px solid #0056b3; }
+    .mode-toggle { margin: 15px 0; padding: 10px; background: #fff; border: 1px solid #ddd; border-radius: 4px; }
+    .mode-toggle label { margin-right: 15px; cursor: pointer; }
+    .mode-toggle input[type="radio"] { margin-right: 5px; }
   </style>
 </head>
 <body>
   <div class="container">
     <h2>Turnstile remoteip_leniency Demo</h2>
     <div class="info">
-      <strong>Current Mode:</strong> ${leniencyMode}<br>
+      <strong>Current Mode:</strong> ${mode}<br>
       <strong>Purpose:</strong> Test undocumented remoteip_leniency parameter in siteverify API
     </div>
-    <p>Complete the challenge and submit to verify with remoteip_leniency="${leniencyMode}"</p>
-    <form method="POST">
+    
+    <div class="mode-toggle">
+      <strong>Select Mode:</strong><br><br>
+      <label><input type="radio" name="mode" value="strict" ${mode === 'strict' ? 'checked' : ''} onchange="location.href='/form?mode=strict'"> strict</label>
+      <label><input type="radio" name="mode" value="relaxed" ${mode === 'relaxed' ? 'checked' : ''} onchange="location.href='/form?mode=relaxed'"> relaxed</label>
+      <label><input type="radio" name="mode" value="off" ${mode === 'off' ? 'checked' : ''} onchange="location.href='/form?mode=off'"> off</label>
+    </div>
+
+    <p>Complete the challenge and submit to verify with remoteip_leniency="${mode}"</p>
+    <form method="POST" action="/form?mode=${mode}">
       <div class="cf-turnstile" data-sitekey="${env.TURNSTILE_SITE_KEY}"></div>
       <br>
       <input type="submit" value="Verify Token">
@@ -231,7 +254,8 @@ const result = await fetch(
     }
 
     if (request.method === 'POST') {
-      return handleTurnstileVerification(request, env);
+      const mode = url.searchParams.get('mode') as 'strict' | 'relaxed' | 'off' | null;
+      return handleTurnstileVerification(request, env, mode);
     }
 
     return new Response('Method not allowed', { status: 405 });
