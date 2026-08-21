@@ -36,31 +36,50 @@ export async function handleTurnstileVerification(
 
     const mode = modeOverride || env.REMOTEIP_LENIENCY || 'strict';
     
-    // First call with specified mode
+    // Triple-call pattern: strict -> relaxed -> off (stops at first success)
     const startTime1 = Date.now();
-    const verificationResult = await verifyTurnstileToken(token, clientIp, env, mode);
+    const strictResult = await verifyTurnstileToken(token, clientIp, env, 'strict');
     const duration1 = Date.now() - startTime1;
     
-    let ipMismatchDetected = false;
-    let secondCallResult = null;
+    let relaxedResult = null;
+    let offResult = null;
     let duration2 = 0;
+    let duration3 = 0;
+    let strictBlocked = false;
+    let relaxedBlocked = false;
+    let ipMismatchDetected = false;
 
-    // Double-call workaround: if first call failed and mode wasn't 'off', retry with 'off'
-    if (!verificationResult.success && mode !== 'off' && 
-        verificationResult["error-codes"].includes("invalid-input-response")) {
+    // If strict failed, try relaxed
+    if (!strictResult.success && strictResult["error-codes"].includes("invalid-input-response")) {
+      strictBlocked = true;
       const startTime2 = Date.now();
-      secondCallResult = await verifyTurnstileToken(token, clientIp, env, 'off');
+      relaxedResult = await verifyTurnstileToken(token, clientIp, env, 'relaxed');
       duration2 = Date.now() - startTime2;
       
-      if (secondCallResult.success) {
-        // First call failed on IP enforcement, second succeeded without it
-        ipMismatchDetected = true;
+      // If relaxed also failed, try off
+      if (!relaxedResult.success && relaxedResult["error-codes"].includes("invalid-input-response")) {
+        relaxedBlocked = true;
+        const startTime3 = Date.now();
+        offResult = await verifyTurnstileToken(token, clientIp, env, 'off');
+        duration3 = Date.now() - startTime3;
+        
+        if (offResult.success) {
+          ipMismatchDetected = true; // Both strict and relaxed blocked, but token is valid
+        }
+      } else if (relaxedResult.success) {
+        ipMismatchDetected = true; // Strict blocked, relaxed passed
       }
     }
+    
+    // Determine final result
+    const verificationResult = strictResult.success ? strictResult : 
+                               (relaxedResult?.success ? relaxedResult : 
+                               (offResult?.success ? offResult : strictResult));
 
-    // Handle IP mismatch detection (double-call succeeded on retry with 'off')
-    if (ipMismatchDetected && secondCallResult) {
+    // Handle IP mismatch detection (triple-call pattern revealed IP issue)
+    if (ipMismatchDetected) {
       const shouldBlock = action === 'block';
+      const finalResult = relaxedResult?.success ? relaxedResult : offResult;
       const warningHtml = `
 <!DOCTYPE html>
 <html>
@@ -91,14 +110,14 @@ export async function handleTurnstileVerification(
 </head>
 <body>
   <div class="warning">
-    <h2>⚠️ IP Mismatch Detected</h2>
-    <p>The double-call pattern successfully identified an IP mismatch. Here's what happened:</p>
+    <h2>⚠️ IP Mismatch Detected (Triple-Call Pattern)</h2>
+    <p>The triple-call pattern successfully identified the IP mismatch level. Here's what happened:</p>
 
     <h3>Call Timeline</h3>
     <div class="timeline">
       <div class="call">
         <div class="call-header">
-          📞 Call #1: siteverify with remoteip_leniency="${mode}"
+          📞 Call #1: siteverify with remoteip_leniency="strict"
           <span class="badge fail">FAILED</span>
           <span style="color: #999; font-size: 12px; font-weight: normal;">(${duration1}ms)</span>
         </div>
@@ -107,42 +126,78 @@ export async function handleTurnstileVerification(
           secret: [REDACTED]<br>
           response: ${token.substring(0, 40)}...<br>
           remoteip: ${clientIp}<br>
-          <strong>remoteip_leniency: ${mode}</strong>
+          <strong>remoteip_leniency: strict</strong>
         </div>
         <div class="call-detail">
           <span class="label">Result:</span> success: false<br>
           <span class="label">Error:</span> ["invalid-input-response"]<br>
-          <span class="label">Reason:</span> IP mismatch (real IP: ${realClientIp}, sent: ${clientIp})
+          <span class="label">Note:</span> Token NOT consumed (IP check failed before token store)
         </div>
       </div>
 
-      <div class="call success">
+      ${relaxedResult ? `
+      <div class="call ${relaxedResult.success ? 'success' : ''}">
         <div class="call-header">
-          📞 Call #2: Retry with remoteip_leniency="off"
-          <span class="badge success">SUCCESS</span>
+          📞 Call #2: Retry with remoteip_leniency="relaxed"
+          <span class="badge ${relaxedResult.success ? 'success' : 'fail'}">${relaxedResult.success ? 'SUCCESS' : 'FAILED'}</span>
           <span style="color: #999; font-size: 12px; font-weight: normal;">(${duration2}ms)</span>
         </div>
         <div class="request">
           POST https://challenges.cloudflare.com/turnstile/v0/siteverify<br>
           secret: [REDACTED]<br>
           response: ${token.substring(0, 40)}... <em>(same token)</em><br>
-          remoteip: ${clientIp}<br>
+          remoteip: ${clientIp} <em>(same IP)</em><br>
+          <strong>remoteip_leniency: relaxed</strong>
+        </div>
+        <div class="call-detail">
+          <span class="label">Result:</span> success: ${relaxedResult.success}<br>
+          ${relaxedResult.success ? `
+            <span class="label">Challenge TS:</span> ${relaxedResult.challenge_ts || 'N/A'}<br>
+            <span class="label">Note:</span> Token consumed here ✓
+          ` : `
+            <span class="label">Error:</span> ["invalid-input-response"]<br>
+            <span class="label">Note:</span> Token still NOT consumed
+          `}
+        </div>
+      </div>
+      ` : ''}
+
+      ${offResult ? `
+      <div class="call success">
+        <div class="call-header">
+          📞 Call #3: Retry with remoteip_leniency="off"
+          <span class="badge success">SUCCESS</span>
+          <span style="color: #999; font-size: 12px; font-weight: normal;">(${duration3}ms)</span>
+        </div>
+        <div class="request">
+          POST https://challenges.cloudflare.com/turnstile/v0/siteverify<br>
+          secret: [REDACTED]<br>
+          response: ${token.substring(0, 40)}... <em>(same token)</em><br>
+          remoteip: ${clientIp} <em>(same IP)</em><br>
           <strong>remoteip_leniency: off</strong>
         </div>
         <div class="call-detail">
           <span class="label">Result:</span> success: true ✓<br>
-          <span class="label">Challenge TS:</span> ${secondCallResult.challenge_ts || 'N/A'}<br>
-          <span class="label">Hostname:</span> ${secondCallResult.hostname || 'N/A'}
+          <span class="label">Challenge TS:</span> ${offResult.challenge_ts || 'N/A'}<br>
+          <span class="label">Note:</span> Token consumed here ✓
         </div>
       </div>
+      ` : ''}
     </div>
 
     <div class="conclusion">
       <strong>🔍 Conclusion:</strong><br>
-      • First call failed due to <strong>IP enforcement</strong> (mode: ${mode})<br>
-      • Second call succeeded when IP checking was disabled<br>
-      • Token is valid, but IP changed between solve and verification<br>
-      • <strong>This is the IP mismatch pattern</strong> — you detected it using the double-call workaround
+      ${relaxedResult?.success ? `
+        • <strong>Strict blocked, relaxed passed</strong><br>
+        • IP mismatch level: Same ASN + same subnet, but different exact IP (or IPv4↔IPv6 cross-family, or private remote IP)<br>
+        • Would be blocked by: strict mode only<br>
+        • Would pass: relaxed and off modes
+      ` : offResult?.success ? `
+        • <strong>Both strict AND relaxed blocked, only off passed</strong><br>
+        • IP mismatch level: Different ASN, or same ASN + different subnet (IPv4 /24, IPv6 /64)<br>
+        • Would be blocked by: both strict and relaxed modes<br>
+        • Would pass: off mode only
+      ` : ''}
     </div>
 
     <h3>Action Taken: ${shouldBlock ? '🚫 Hard Block' : '✅ Allow + Flag'}</h3>
@@ -173,10 +228,12 @@ export async function handleTurnstileVerification(
 
     <details>
       <summary>View Full API Responses</summary>
-      <h4>First Call Response:</h4>
-      <pre>${JSON.stringify(verificationResult, null, 2)}</pre>
-      <h4>Second Call Response:</h4>
-      <pre>${JSON.stringify(secondCallResult, null, 2)}</pre>
+      <h4>Call #1 (strict) Response:</h4>
+      <pre>${JSON.stringify(strictResult, null, 2)}</pre>
+      ${relaxedResult ? `<h4>Call #2 (relaxed) Response:</h4>
+      <pre>${JSON.stringify(relaxedResult, null, 2)}</pre>` : ''}
+      ${offResult ? `<h4>Call #3 (off) Response:</h4>
+      <pre>${JSON.stringify(offResult, null, 2)}</pre>` : ''}
     </details>
     
     <a href="/form">← Try again</a>
@@ -196,11 +253,11 @@ export async function handleTurnstileVerification(
 <head>
   <title>Verification Failed</title>
   <style>
-    body { font-family: Arial, sans-serif; max-width: 600px; margin: 50px auto; padding: 20px; }
+    body { font-family: Arial, sans-serif; max-width: 700px; margin: 50px auto; padding: 20px; }
     .error { border: 2px solid #dc3545; padding: 20px; border-radius: 8px; background: #f8d7da; }
     h2 { color: #dc3545; }
     .errors { background: #fff; padding: 10px; margin: 15px 0; border-radius: 4px; }
-    .doubleCall { background: #f8f9fa; padding: 10px; margin: 15px 0; border-left: 4px solid #dc3545; font-size: 14px; }
+    .tripleCall { background: #f8f9fa; padding: 10px; margin: 15px 0; border-left: 4px solid #dc3545; font-size: 14px; }
     a { display: inline-block; margin-top: 20px; color: #0056b3; }
   </style>
 </head>
@@ -209,27 +266,32 @@ export async function handleTurnstileVerification(
     <h2>❌ Verification Failed</h2>
     <div class="errors">
       <strong>Error codes:</strong> ${verificationResult["error-codes"].join(", ")}<br><br>
-      <strong>Mode Used:</strong> ${mode}<br>
       <strong>Real Client IP:</strong> ${realClientIp}<br>
       <strong>IP Sent to Verify:</strong> ${clientIp}${mismatchIp ? ' (MISMATCHED)' : ''}
     </div>
     
-    ${secondCallResult ? `
-    <div class="doubleCall">
-      <strong>Double-Call Pattern Result:</strong><br>
-      • First call with <code>${mode}</code> → failed<br>
-      • Second call with <code>off</code> → also failed<br>
-      • <strong>Conclusion:</strong> Token invalid for reasons other than IP (expired, reused, malformed, etc.)
+    ${offResult ? `
+    <div class="tripleCall">
+      <strong>Triple-Call Pattern Result:</strong><br>
+      • Call #1 (strict) → failed<br>
+      • Call #2 (relaxed) → failed<br>
+      • Call #3 (off) → failed<br>
+      • <strong>Conclusion:</strong> Token invalid for reasons other than IP (expired, reused, malformed, rule-blocked, etc.)
     </div>
     <details>
-      <summary style="cursor: pointer;">Second Call Response</summary>
-      <pre style="background: #fff; padding: 10px; margin-top: 10px;">${JSON.stringify(secondCallResult, null, 2)}</pre>
+      <summary style="cursor: pointer;">All API Responses</summary>
+      <h4>Call #1 (strict):</h4>
+      <pre style="background: #fff; padding: 10px; margin-top: 10px;">${JSON.stringify(strictResult, null, 2)}</pre>
+      <h4>Call #2 (relaxed):</h4>
+      <pre style="background: #fff; padding: 10px; margin-top: 10px;">${JSON.stringify(relaxedResult, null, 2)}</pre>
+      <h4>Call #3 (off):</h4>
+      <pre style="background: #fff; padding: 10px; margin-top: 10px;">${JSON.stringify(offResult, null, 2)}</pre>
     </details>
     ` : ''}
 
     <details style="margin-top: 15px;">
-      <summary style="cursor: pointer; color: #dc3545;">First Call Response</summary>
-      <pre style="background: #fff; padding: 10px; margin-top: 10px; overflow-x: auto;">${JSON.stringify(verificationResult, null, 2)}</pre>
+      <summary style="cursor: pointer; color: #dc3545;">API Response</summary>
+      <pre style="background: #fff; padding: 10px; margin-top: 10px; overflow-x: auto;">${JSON.stringify(strictResult, null, 2)}</pre>
     </details>
     <a href="/form">← Try again</a>
   </div>
@@ -261,13 +323,13 @@ export async function handleTurnstileVerification(
     <h2>✅ Turnstile Verification Successful</h2>
     
     <div class="info">
-      <strong>Single Call Success</strong><br>
-      First call with <code>remoteip_leniency="${mode}"</code> succeeded immediately.<br>
-      No double-call needed — IP matched the ${mode} policy (or mode is "off").
+      <strong>Strict Mode Success</strong><br>
+      First call with <code>remoteip_leniency="strict"</code> succeeded immediately.<br>
+      No additional calls needed — IP matched exactly (strict is the most restrictive policy).
     </div>
 
     <div class="result">
-      <div><span class="label">Mode Used:</span> ${mode}</div>
+      <div><span class="label">Triple-Call Result:</span> Passed strict (stopped at call #1)</div>
       <div><span class="label">Duration:</span> ${duration1}ms</div>
       <div><span class="label">Real Client IP:</span> ${realClientIp}</div>
       <div><span class="label">IP Sent to Verify:</span> ${clientIp}${mismatchIp ? ' (MISMATCHED)' : ''}</div>
@@ -480,16 +542,16 @@ return { allow: false, error: result1["error-codes"] };</pre>
     ${mismatchIp ? '<div class="warning"><strong>⚠️ IP Mismatch Mode:</strong> Will send 8.8.8.8 (Google DNS, different ASN) instead of your real IP to trigger validation failure. Works with both strict and relaxed modes.</div>' : ''}
 
     <div class="info" style="background: #e7f3ff; border-left-color: #0066cc; font-size: 14px;">
-      <strong>What happens when you submit:</strong><br>
-      ${mode !== 'off' ? `
-        1️⃣ First call: siteverify with <code>remoteip_leniency="${mode}"</code><br>
-        2️⃣ If first call fails with <code>invalid-input-response</code> → automatic retry with <code>remoteip_leniency="off"</code><br>
-        3️⃣ If retry succeeds → <strong>IP mismatch detected!</strong> (you'll see the double-call timeline)<br>
-        4️⃣ If retry also fails → token invalid for other reason (expired/reused/malformed)
-      ` : `
-        • Single call: siteverify with <code>remoteip_leniency="off"</code><br>
-        • No double-call needed (IP enforcement already disabled)
-      `}
+      <strong>What happens when you submit (Triple-Call Pattern):</strong><br>
+      1️⃣ Call #1: siteverify with <code>remoteip_leniency="strict"</code><br>
+      2️⃣ If call #1 fails → Call #2 with <code>remoteip_leniency="relaxed"</code> (same token)<br>
+      3️⃣ If call #2 also fails → Call #3 with <code>remoteip_leniency="off"</code> (same token)<br>
+      <br>
+      <strong>Pattern stops at first success:</strong><br>
+      • Passed strict → no IP mismatch, no additional calls<br>
+      • Failed strict, passed relaxed → strict-only mismatch<br>
+      • Failed both, passed off → both strict + relaxed would block<br>
+      • All three failed → token invalid (expired/reused/malformed)
     </div>
 
     <p>Complete the challenge and submit:</p>

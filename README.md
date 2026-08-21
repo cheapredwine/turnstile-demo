@@ -6,20 +6,22 @@ Cloudflare Worker demonstrating the undocumented `remoteip_leniency` parameter i
 
 ## What This Does
 
-Demonstrates Turnstile's undocumented `remoteip_leniency` parameter + double-call workaround for detecting IP mismatches.
+Demonstrates Turnstile's undocumented `remoteip_leniency` parameter + **triple-call pattern** to determine exact IP mismatch level.
 
 **Modes:**
 - `off` (default) - No IP enforcement
 - `strict` - Exact IP match required (any mismatch = reject)
 - `relaxed` - Same ASN/subnet required (rejects different ASN, different subnet IPv4 /24 or IPv6 /64)
 
-**Problem:** When `strict`/`relaxed` blocks a token, error code is `invalid-input-response` (same as expired/reused tokens). No way to distinguish IP mismatch from other failures.
+**Problem:** When `strict`/`relaxed` blocks a token, error code is `invalid-input-response` (same as expired/reused tokens). Can't distinguish IP mismatch from other failures, or strict-level vs relaxed-level mismatch.
 
-**Solution:** Double-call pattern:
-1. Call with `strict` (or `relaxed`)
-2. If failed → retry same token with `off`
-3. If retry succeeds → IP mismatch detected (flag/allow)
-4. If retry fails → token invalid for other reason (reject)
+**Solution:** Triple-call pattern (strict → relaxed → off):
+1. Call #1: `strict` → if succeeds, stop (no mismatch)
+2. Call #2: `relaxed` → if succeeds, strict-only mismatch detected
+3. Call #3: `off` → if succeeds, both strict + relaxed would block
+4. All failed → token invalid for other reason (expired/reused/malformed)
+
+**Key insight:** Failed IP checks don't consume the token (IP check happens before token store). First successful call consumes it.
 
 ## Quick Start
 

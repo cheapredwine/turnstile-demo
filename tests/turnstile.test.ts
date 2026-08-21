@@ -129,7 +129,9 @@ describe('Turnstile Verification', () => {
         body: formData
       });
 
-      // First call fails with invalid-input-response
+      // Triple-call pattern: all three calls fail
+      
+      // Call #1: strict fails
       mockFetch.mockResolvedValueOnce({
         json: async () => ({
           success: false,
@@ -138,7 +140,16 @@ describe('Turnstile Verification', () => {
         })
       } as Response);
 
-      // Second call (double-call pattern with 'off') also fails - token genuinely invalid
+      // Call #2: relaxed also fails
+      mockFetch.mockResolvedValueOnce({
+        json: async () => ({
+          success: false,
+          "error-codes": ['invalid-input-response'],
+          "remoteip_leniency": "relaxed"
+        })
+      } as Response);
+
+      // Call #3: off also fails - token genuinely invalid
       mockFetch.mockResolvedValueOnce({
         json: async () => ({
           success: false,
@@ -383,6 +394,233 @@ describe('Turnstile Verification', () => {
 
       const formDataArg = mockFetch.mock.calls[0][1].body as FormData;
       expect(formDataArg.get('remoteip_leniency')).toBe('strict');
+    });
+  });
+
+  describe('Triple-Call Pattern', () => {
+    it('should stop at strict if first call succeeds', async () => {
+      const formData = new FormData();
+      formData.append('cf-turnstile-response', 'valid-token');
+
+      const request = new Request('http://localhost/form', {
+        method: 'POST',
+        headers: { 'CF-Connecting-IP': '192.168.1.1' },
+        body: formData
+      });
+
+      // Strict succeeds - should not make additional calls
+      mockFetch.mockResolvedValueOnce({
+        json: async () => ({
+          success: true,
+          "error-codes": [],
+          "remoteip_leniency": "strict"
+        })
+      } as Response);
+
+      const response = await handleTurnstileVerification(request, mockEnv);
+
+      expect(response.status).toBe(200);
+      expect(mockFetch).toHaveBeenCalledTimes(1); // Only one call
+      const text = await response.text();
+      expect(text).toContain('Strict Mode Success');
+    });
+
+    it('should make 2 calls if strict fails but relaxed succeeds', async () => {
+      const formData = new FormData();
+      formData.append('cf-turnstile-response', 'valid-token');
+
+      const request = new Request('http://localhost/form', {
+        method: 'POST',
+        headers: { 'CF-Connecting-IP': '192.168.1.1' },
+        body: formData
+      });
+
+      // Call #1: strict fails
+      mockFetch.mockResolvedValueOnce({
+        json: async () => ({
+          success: false,
+          "error-codes": ['invalid-input-response'],
+          "remoteip_leniency": "strict"
+        })
+      } as Response);
+
+      // Call #2: relaxed succeeds
+      mockFetch.mockResolvedValueOnce({
+        json: async () => ({
+          success: true,
+          "error-codes": [],
+          "remoteip_leniency": "relaxed",
+          challenge_ts: '2024-01-01T00:00:00Z'
+        })
+      } as Response);
+
+      const response = await handleTurnstileVerification(request, mockEnv);
+
+      expect(response.status).toBe(200); // Default action is allow
+      expect(mockFetch).toHaveBeenCalledTimes(2); // Two calls
+      const text = await response.text();
+      expect(text).toContain('IP Mismatch Detected');
+      expect(text).toContain('Strict blocked, relaxed passed');
+      expect(text).toContain('Call #1');
+      expect(text).toContain('Call #2');
+    });
+
+    it('should make 3 calls if strict and relaxed fail but off succeeds', async () => {
+      const formData = new FormData();
+      formData.append('cf-turnstile-response', 'valid-token');
+
+      const request = new Request('http://localhost/form', {
+        method: 'POST',
+        headers: { 'CF-Connecting-IP': '192.168.1.1' },
+        body: formData
+      });
+
+      // Call #1: strict fails
+      mockFetch.mockResolvedValueOnce({
+        json: async () => ({
+          success: false,
+          "error-codes": ['invalid-input-response'],
+          "remoteip_leniency": "strict"
+        })
+      } as Response);
+
+      // Call #2: relaxed fails
+      mockFetch.mockResolvedValueOnce({
+        json: async () => ({
+          success: false,
+          "error-codes": ['invalid-input-response'],
+          "remoteip_leniency": "relaxed"
+        })
+      } as Response);
+
+      // Call #3: off succeeds
+      mockFetch.mockResolvedValueOnce({
+        json: async () => ({
+          success: true,
+          "error-codes": [],
+          challenge_ts: '2024-01-01T00:00:00Z'
+        })
+      } as Response);
+
+      const response = await handleTurnstileVerification(request, mockEnv);
+
+      expect(response.status).toBe(200); // Default action is allow
+      expect(mockFetch).toHaveBeenCalledTimes(3); // Three calls
+      const text = await response.text();
+      expect(text).toContain('IP Mismatch Detected');
+      expect(text).toContain('Both strict AND relaxed blocked');
+      expect(text).toContain('Call #1');
+      expect(text).toContain('Call #2');
+      expect(text).toContain('Call #3');
+    });
+
+    it('should return 401 if all three calls fail', async () => {
+      const formData = new FormData();
+      formData.append('cf-turnstile-response', 'invalid-token');
+
+      const request = new Request('http://localhost/form', {
+        method: 'POST',
+        headers: { 'CF-Connecting-IP': '192.168.1.1' },
+        body: formData
+      });
+
+      // All three calls fail
+      mockFetch.mockResolvedValueOnce({
+        json: async () => ({
+          success: false,
+          "error-codes": ['invalid-input-response']
+        })
+      } as Response);
+
+      mockFetch.mockResolvedValueOnce({
+        json: async () => ({
+          success: false,
+          "error-codes": ['invalid-input-response']
+        })
+      } as Response);
+
+      mockFetch.mockResolvedValueOnce({
+        json: async () => ({
+          success: false,
+          "error-codes": ['invalid-input-response']
+        })
+      } as Response);
+
+      const response = await handleTurnstileVerification(request, mockEnv);
+
+      expect(response.status).toBe(401);
+      expect(mockFetch).toHaveBeenCalledTimes(3); // All three calls made
+      const text = await response.text();
+      expect(text).toContain('Verification Failed');
+      expect(text).toContain('Triple-Call Pattern Result');
+    });
+
+    it('should respect action=block parameter on IP mismatch', async () => {
+      const formData = new FormData();
+      formData.append('cf-turnstile-response', 'valid-token');
+
+      const request = new Request('http://localhost/form', {
+        method: 'POST',
+        headers: { 'CF-Connecting-IP': '192.168.1.1' },
+        body: formData
+      });
+
+      // Strict fails, relaxed succeeds
+      mockFetch.mockResolvedValueOnce({
+        json: async () => ({
+          success: false,
+          "error-codes": ['invalid-input-response']
+        })
+      } as Response);
+
+      mockFetch.mockResolvedValueOnce({
+        json: async () => ({
+          success: true,
+          "error-codes": [],
+          challenge_ts: '2024-01-01T00:00:00Z'
+        })
+      } as Response);
+
+      const response = await handleTurnstileVerification(request, mockEnv, null, false, 'block');
+
+      expect(response.status).toBe(401); // Block action
+      const text = await response.text();
+      expect(text).toContain('Hard Block');
+      expect(text).toContain('Request BLOCKED');
+    });
+
+    it('should respect action=allow parameter on IP mismatch', async () => {
+      const formData = new FormData();
+      formData.append('cf-turnstile-response', 'valid-token');
+
+      const request = new Request('http://localhost/form', {
+        method: 'POST',
+        headers: { 'CF-Connecting-IP': '192.168.1.1' },
+        body: formData
+      });
+
+      // Strict fails, relaxed succeeds
+      mockFetch.mockResolvedValueOnce({
+        json: async () => ({
+          success: false,
+          "error-codes": ['invalid-input-response']
+        })
+      } as Response);
+
+      mockFetch.mockResolvedValueOnce({
+        json: async () => ({
+          success: true,
+          "error-codes": [],
+          challenge_ts: '2024-01-01T00:00:00Z'
+        })
+      } as Response);
+
+      const response = await handleTurnstileVerification(request, mockEnv, null, false, 'allow');
+
+      expect(response.status).toBe(200); // Allow action
+      const text = await response.text();
+      expect(text).toContain('Allow + Flag');
+      expect(text).toContain('Request ALLOWED + FLAGGED');
     });
   });
 });
