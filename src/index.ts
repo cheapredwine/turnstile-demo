@@ -26,8 +26,9 @@ export async function handleTurnstileVerification(
     const formData = await request.formData();
     const token = formData.get('cf-turnstile-response') as string;
     const realClientIp = request.headers.get('CF-Connecting-IP') || '0.0.0.0';
-    // Use fake IP (TEST-NET-1 from RFC 5737) to simulate mismatch
-    const clientIp = mismatchIp ? '192.0.2.1' : realClientIp;
+    // Use fake IP (Google DNS - definitely different ASN) to simulate mismatch
+    // 192.0.2.1 is TEST-NET-1 which relaxed mode may treat as private/special
+    const clientIp = mismatchIp ? '8.8.8.8' : realClientIp;
 
     if (!token) {
       return new Response('No Turnstile token provided', { status: 400 });
@@ -476,7 +477,7 @@ return { allow: false, error: result1["error-codes"] };</pre>
       <label><input type="radio" name="action" value="block" ${action === 'block' ? 'checked' : ''} onchange="updateAction()"> Hard Block (reject - attacker knows immediately)</label>
     </div>
 
-    ${mismatchIp ? '<div class="warning"><strong>⚠️ IP Mismatch Mode:</strong> Will send 192.0.2.1 instead of your real IP to trigger validation failure. Use this to see how each mode handles mismatches.</div>' : ''}
+    ${mismatchIp ? '<div class="warning"><strong>⚠️ IP Mismatch Mode:</strong> Will send 8.8.8.8 (Google DNS, different ASN) instead of your real IP to trigger validation failure. Works with both strict and relaxed modes.</div>' : ''}
 
     <div class="info" style="background: #e7f3ff; border-left-color: #0066cc; font-size: 14px;">
       <strong>What happens when you submit:</strong><br>
