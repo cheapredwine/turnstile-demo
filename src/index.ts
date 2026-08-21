@@ -35,14 +35,21 @@ export async function handleTurnstileVerification(
     const mode = modeOverride || env.REMOTEIP_LENIENCY || 'strict';
     
     // First call with specified mode
+    const startTime1 = Date.now();
     const verificationResult = await verifyTurnstileToken(token, clientIp, env, mode);
+    const duration1 = Date.now() - startTime1;
+    
     let ipMismatchDetected = false;
     let secondCallResult = null;
+    let duration2 = 0;
 
     // Double-call workaround: if first call failed and mode wasn't 'off', retry with 'off'
     if (!verificationResult.success && mode !== 'off' && 
         verificationResult["error-codes"].includes("invalid-input-response")) {
+      const startTime2 = Date.now();
       secondCallResult = await verifyTurnstileToken(token, clientIp, env, 'off');
+      duration2 = Date.now() - startTime2;
+      
       if (secondCallResult.success) {
         // First call failed on IP enforcement, second succeeded without it
         ipMismatchDetected = true;
@@ -57,46 +64,98 @@ export async function handleTurnstileVerification(
 <head>
   <title>IP Mismatch Detected</title>
   <style>
-    body { font-family: Arial, sans-serif; max-width: 700px; margin: 50px auto; padding: 20px; }
+    body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; line-height: 1.6; }
     .warning { border: 2px solid #ffc107; padding: 20px; border-radius: 8px; background: #fff3cd; }
     h2 { color: #856404; }
-    .result { background: #fff; padding: 15px; margin: 15px 0; border-radius: 4px; font-family: monospace; font-size: 14px; }
-    .label { font-weight: bold; color: #856404; }
-    .doubleCall { background: #f8f9fa; padding: 15px; margin: 15px 0; border-left: 4px solid #ffc107; }
-    a { display: inline-block; margin-top: 20px; color: #0056b3; }
+    h3 { color: #666; margin-top: 25px; }
+    .timeline { margin: 20px 0; }
+    .call { background: #fff; border-left: 4px solid #dc3545; padding: 15px; margin: 15px 0; border-radius: 4px; }
+    .call.success { border-left-color: #28a745; }
+    .call-header { font-weight: bold; font-size: 16px; margin-bottom: 10px; }
+    .call-detail { font-family: monospace; font-size: 13px; margin: 5px 0; }
+    .label { font-weight: bold; color: #555; }
+    .badge { display: inline-block; padding: 3px 8px; border-radius: 3px; font-size: 12px; font-weight: bold; }
+    .badge.fail { background: #dc3545; color: white; }
+    .badge.success { background: #28a745; color: white; }
+    .request { background: #f8f9fa; padding: 10px; margin: 10px 0; border-radius: 4px; font-family: monospace; font-size: 12px; }
+    .conclusion { background: #f8f9fa; padding: 15px; margin: 20px 0; border-left: 4px solid #ffc107; }
+    details { margin: 15px 0; }
+    summary { cursor: pointer; color: #856404; font-weight: bold; }
+    pre { background: #2d2d2d; color: #f8f8f2; padding: 10px; border-radius: 4px; overflow-x: auto; font-size: 12px; }
+    a { display: inline-block; margin-top: 20px; color: #0056b3; text-decoration: none; }
+    a:hover { text-decoration: underline; }
   </style>
 </head>
 <body>
   <div class="warning">
-    <h2>⚠️ IP Mismatch Detected (Double-Call Pattern)</h2>
-    
-    <div class="doubleCall">
-      <strong>What happened:</strong><br>
-      1. First call with <code>${mode}</code> → failed (IP mismatch)<br>
-      2. Retry with <code>off</code> → succeeded (token valid, IP enforcement was the issue)
-    </div>
+    <h2>⚠️ IP Mismatch Detected</h2>
+    <p>The double-call pattern successfully identified an IP mismatch. Here's what happened:</p>
 
-    <div class="result">
-      <div><span class="label">First Call Mode:</span> ${mode}</div>
-      <div><span class="label">First Call Result:</span> FAILED (invalid-input-response)</div>
-      <div><span class="label">Second Call Mode:</span> off</div>
-      <div><span class="label">Second Call Result:</span> SUCCESS ✓</div>
-      <div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid #ddd;">
-        <span class="label">Real Client IP:</span> ${realClientIp}<br>
-        <span class="label">IP Sent to Verify:</span> ${clientIp}${mismatchIp ? ' (MISMATCHED)' : ''}<br>
-        <span class="label">Token:</span> Valid, but IP didn't match ${mode} policy
+    <h3>Call Timeline</h3>
+    <div class="timeline">
+      <div class="call">
+        <div class="call-header">
+          📞 Call #1: siteverify with remoteip_leniency="${mode}"
+          <span class="badge fail">FAILED</span>
+          <span style="color: #999; font-size: 12px; font-weight: normal;">(${duration1}ms)</span>
+        </div>
+        <div class="request">
+          POST https://challenges.cloudflare.com/turnstile/v0/siteverify<br>
+          secret: [REDACTED]<br>
+          response: ${token.substring(0, 40)}...<br>
+          remoteip: ${clientIp}<br>
+          <strong>remoteip_leniency: ${mode}</strong>
+        </div>
+        <div class="call-detail">
+          <span class="label">Result:</span> success: false<br>
+          <span class="label">Error:</span> ["invalid-input-response"]<br>
+          <span class="label">Reason:</span> IP mismatch (real IP: ${realClientIp}, sent: ${clientIp})
+        </div>
+      </div>
+
+      <div class="call success">
+        <div class="call-header">
+          📞 Call #2: Retry with remoteip_leniency="off"
+          <span class="badge success">SUCCESS</span>
+          <span style="color: #999; font-size: 12px; font-weight: normal;">(${duration2}ms)</span>
+        </div>
+        <div class="request">
+          POST https://challenges.cloudflare.com/turnstile/v0/siteverify<br>
+          secret: [REDACTED]<br>
+          response: ${token.substring(0, 40)}... <em>(same token)</em><br>
+          remoteip: ${clientIp}<br>
+          <strong>remoteip_leniency: off</strong>
+        </div>
+        <div class="call-detail">
+          <span class="label">Result:</span> success: true ✓<br>
+          <span class="label">Challenge TS:</span> ${secondCallResult.challenge_ts || 'N/A'}<br>
+          <span class="label">Hostname:</span> ${secondCallResult.hostname || 'N/A'}
+        </div>
       </div>
     </div>
 
-    <p><strong>Decision point:</strong> Token is valid but IP changed. You can:</p>
+    <div class="conclusion">
+      <strong>🔍 Conclusion:</strong><br>
+      • First call failed due to <strong>IP enforcement</strong> (mode: ${mode})<br>
+      • Second call succeeded when IP checking was disabled<br>
+      • Token is valid, but IP changed between solve and verification<br>
+      • <strong>This is the IP mismatch pattern</strong> — you detected it using the double-call workaround
+    </div>
+
+    <h3>Decision Point</h3>
+    <p>Token is valid but IP didn't match ${mode} policy. Options:</p>
     <ul>
       <li><strong>Allow + Flag:</strong> Let user through but log for review (this demo allows)</li>
       <li><strong>Hard Block:</strong> Reject as suspicious (attacker knows they're detected)</li>
+      <li><strong>Step-Up Auth:</strong> Require additional verification (MFA, email code, etc.)</li>
     </ul>
 
     <details>
-      <summary style="cursor: pointer;">Second Call Full Response</summary>
-      <pre style="background: #fff; padding: 10px; margin-top: 10px;">${JSON.stringify(secondCallResult, null, 2)}</pre>
+      <summary>View Full API Responses</summary>
+      <h4>First Call Response:</h4>
+      <pre>${JSON.stringify(verificationResult, null, 2)}</pre>
+      <h4>Second Call Response:</h4>
+      <pre>${JSON.stringify(secondCallResult, null, 2)}</pre>
     </details>
     
     <a href="/form">← Try again</a>
@@ -166,9 +225,10 @@ export async function handleTurnstileVerification(
 <head>
   <title>Verification Success</title>
   <style>
-    body { font-family: Arial, sans-serif; max-width: 600px; margin: 50px auto; padding: 20px; }
+    body { font-family: Arial, sans-serif; max-width: 700px; margin: 50px auto; padding: 20px; }
     .success { border: 2px solid #28a745; padding: 20px; border-radius: 8px; background: #d4edda; }
-    .result { background: #f8f9fa; padding: 15px; margin: 15px 0; border-radius: 4px; font-family: monospace; }
+    .result { background: #f8f9fa; padding: 15px; margin: 15px 0; border-radius: 4px; font-family: monospace; font-size: 14px; }
+    .info { background: #e7f5ff; padding: 12px; margin: 15px 0; border-left: 4px solid #0066cc; font-size: 14px; }
     h2 { color: #28a745; }
     .label { font-weight: bold; }
     a { display: inline-block; margin-top: 20px; color: #0056b3; }
@@ -177,8 +237,16 @@ export async function handleTurnstileVerification(
 <body>
   <div class="success">
     <h2>✅ Turnstile Verification Successful</h2>
+    
+    <div class="info">
+      <strong>Single Call Success</strong><br>
+      First call with <code>remoteip_leniency="${mode}"</code> succeeded immediately.<br>
+      No double-call needed — IP matched the ${mode} policy (or mode is "off").
+    </div>
+
     <div class="result">
-      <div><span class="label">Mode Used:</span> ${mode} (first call only, no double-call needed)</div>
+      <div><span class="label">Mode Used:</span> ${mode}</div>
+      <div><span class="label">Duration:</span> ${duration1}ms</div>
       <div><span class="label">Real Client IP:</span> ${realClientIp}</div>
       <div><span class="label">IP Sent to Verify:</span> ${clientIp}${mismatchIp ? ' (MISMATCHED)' : ''}</div>
       <div><span class="label">Challenge TS:</span> ${verificationResult.challenge_ts || 'N/A'}</div>
@@ -296,7 +364,34 @@ const result = await fetch(
   { method: 'POST', body: formData }
 );</pre>
 
-    <p><em>Note: This parameter is not in official docs but works in production. Current mode for this demo: <code>${leniencyMode}</code></em></p>
+    <h3>Implementation Example: Double-Call Pattern</h3>
+    <p>This demo implements the recommended pattern for detecting IP mismatches:</p>
+    <pre>// Step 1: First call with strict/relaxed
+const result1 = await verifyTurnstile(token, visitorIP, "strict");
+
+if (result1.success) {
+  return { allow: true, ipMismatch: false };
+}
+
+// Step 2: If failed, check if it was IP mismatch
+if (result1["error-codes"].includes("invalid-input-response")) {
+  // Retry same token with enforcement OFF
+  const result2 = await verifyTurnstile(token, visitorIP, "off");
+  
+  if (result2.success) {
+    // First failed on IP, second succeeded without enforcement
+    return { 
+      allow: true,  // or false - your choice
+      ipMismatch: true,
+      flagForReview: true 
+    };
+  }
+}
+
+// Both calls failed - token invalid for other reason
+return { allow: false, error: result1["error-codes"] };</pre>
+
+    <p><strong>Why it works:</strong> Tokens are consumed only on successful validation. A failed strict call followed by a successful off call proves the failure was IP-related, not token expiry/reuse/etc.</p>
 
     <a href="/form" class="btn">Try the Demo →</a>
   </div>
@@ -355,7 +450,20 @@ const result = await fetch(
 
     ${mismatchIp ? '<div class="warning"><strong>⚠️ IP Mismatch Mode:</strong> Will send 192.0.2.1 instead of your real IP to trigger validation failure. Use this to see how each mode handles mismatches.</div>' : ''}
 
-    <p>Complete the challenge and submit to verify with remoteip_leniency="${mode}"</p>
+    <div class="info" style="background: #e7f3ff; border-left-color: #0066cc; font-size: 14px;">
+      <strong>What happens when you submit:</strong><br>
+      ${mode !== 'off' ? `
+        1️⃣ First call: siteverify with <code>remoteip_leniency="${mode}"</code><br>
+        2️⃣ If it fails with <code>invalid-input-response</code>, automatic retry with <code>remoteip_leniency="off"</code><br>
+        3️⃣ If retry succeeds → <strong>IP mismatch detected</strong> (you'll see the double-call timeline)<br>
+        4️⃣ If retry fails → token invalid for other reason
+      ` : `
+        • Single call: siteverify with <code>remoteip_leniency="off"</code><br>
+        • No double-call (IP enforcement disabled)
+      `}
+    </div>
+
+    <p>Complete the challenge and submit:</p>
     <form method="POST" action="/form?mode=${mode}${mismatchIp ? '&mismatch=true' : ''}">
       <div class="cf-turnstile" data-sitekey="${env.TURNSTILE_SITE_KEY}"></div>
       <br>
