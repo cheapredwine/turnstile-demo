@@ -97,30 +97,42 @@ npm run deploy
 
 ## Implementation Details
 
-**Double-Call Pattern (src/index.ts:37-50):**
+**Triple-Call Pattern (src/index.ts:37-67):**
 ```typescript
-const verificationResult = await verifyTurnstileToken(token, clientIp, env, mode);
+// Call #1: strict
+const strictResult = await verifyTurnstileToken(token, clientIp, env, 'strict');
 
-// If first call failed with invalid-input-response, retry with 'off'
-if (!verificationResult.success && mode !== 'off' && 
-    verificationResult["error-codes"].includes("invalid-input-response")) {
-  const secondCallResult = await verifyTurnstileToken(token, clientIp, env, 'off');
-  if (secondCallResult.success) {
-    ipMismatchDetected = true; // First failed on IP, second succeeded
+if (!strictResult.success && strictResult["error-codes"].includes("invalid-input-response")) {
+  // Call #2: relaxed (token still valid - strict IP check didn't consume it)
+  const relaxedResult = await verifyTurnstileToken(token, clientIp, env, 'relaxed');
+  
+  if (!relaxedResult.success && relaxedResult["error-codes"].includes("invalid-input-response")) {
+    // Call #3: off (token still valid - neither IP check consumed it)
+    const offResult = await verifyTurnstileToken(token, clientIp, env, 'off');
+    // Pattern stops here - off consumes token if successful
   }
 }
 ```
 
-**Response types:**
-1. **Success** (200) - First call passed, no double-call needed
-2. **IP Mismatch Detected** (200) - First failed, second passed → flag but allow
-3. **Hard Failure** (401) - Both calls failed → token invalid (expired/reused/etc)
+**Decision Matrix:**
+| strict | relaxed | off | Meaning | Calls Made |
+|--------|---------|-----|---------|------------|
+| ✅ pass | - | - | Exact IP match | 1 |
+| ❌ fail | ✅ pass | - | Same ASN/subnet, different exact IP | 2 |
+| ❌ fail | ❌ fail | ✅ pass | Different ASN or subnet | 3 |
+| ❌ fail | ❌ fail | ❌ fail | Token invalid (expired/reused) | 3 |
 
-**Important:**
-- Tokens consumed only on successful validation
-- Failed strict + successful off = safe, demonstrates IP mismatch
-- Default mode is `off` (not `strict` as previously thought)
-- `relaxed` checks ASN + subnet, not just exact IP
+**Response types:**
+1. **Strict Success** (200) - Exact IP match, 1 call
+2. **IP Mismatch: Strict Only** (200/401) - 2 calls, relaxed passed
+3. **IP Mismatch: Both Modes** (200/401) - 3 calls, only off passed
+4. **Hard Failure** (401) - 3 calls, all failed
+
+**Critical:**
+- Failed IP checks **don't consume token** (IP check happens before token store)
+- First successful call consumes token
+- Must check for `invalid-input-response` error (not just any failure)
+- Non-IP errors won't trigger retries
 
 **Test structure:**
 1. verifyTurnstileToken - API call formatting
