@@ -477,6 +477,28 @@ return { allow: false, error: result1["error-codes"] };</pre>
 
     <p><strong>Why it works:</strong> Tokens are consumed only on successful validation. A failed strict call followed by a successful off call proves the failure was IP-related, not token expiry/reuse/etc.</p>
 
+    <h3>Example Scenarios</h3>
+    
+    <h4>Scenario A: Strict-Only Mismatch (2 calls)</h4>
+    <pre>User solves challenge from: 192.168.1.100 (Comcast, ASN 7922)
+User IP changes to:         192.168.1.200 (Comcast, ASN 7922)
+
+Call #1 (strict):  192.168.1.100 ≠ 192.168.1.200 → FAIL
+Call #2 (relaxed): Same ASN (7922) + same /24 → SUCCESS ✓
+
+Result: Strict blocked, relaxed passed (2 calls made)</pre>
+
+    <h4>Scenario B: Both Modes Block (3 calls)</h4>
+    <pre>User solves challenge from: 203.0.113.50 (ISP A, ASN 12345)
+User IP changes to:         8.8.8.8 (Google, ASN 15169)
+
+Call #1 (strict):  203.0.113.50 ≠ 8.8.8.8 → FAIL
+Call #2 (relaxed): ASN 12345 ≠ ASN 15169 → FAIL
+Call #3 (off):     (no IP check) → SUCCESS ✓
+
+Result: Both blocked (3 calls made)
+<strong>This demo simulates Scenario B using 8.8.8.8</strong></pre>
+
     <a href="/form" class="btn">Try the Demo →</a>
   </div>
 </body>
@@ -529,8 +551,11 @@ return { allow: false, error: result1["error-codes"] };</pre>
     <div class="test-toggle">
       <label>
         <input type="checkbox" id="mismatch" ${mismatchIp ? 'checked' : ''} onchange="updateMismatch()">
-        <strong>Simulate IP Mismatch</strong> (send wrong IP to demonstrate failure)
+        <strong>Simulate IP Mismatch</strong> (send 8.8.8.8 - different ASN, triggers both strict + relaxed failure)
       </label>
+      <div style="font-size: 12px; color: #666; margin-top: 5px; margin-left: 25px;">
+        Note: Demonstrating strict-only failure (same ASN, different IP) requires knowing your subnet in advance, which we can't do client-side. With 8.8.8.8, you'll see the "both strict + relaxed blocked" scenario (3 calls).
+      </div>
     </div>
 
     <div class="test-toggle">
@@ -539,7 +564,15 @@ return { allow: false, error: result1["error-codes"] };</pre>
       <label><input type="radio" name="action" value="block" ${action === 'block' ? 'checked' : ''} onchange="updateAction()"> Hard Block (reject - attacker knows immediately)</label>
     </div>
 
-    ${mismatchIp ? '<div class="warning"><strong>⚠️ IP Mismatch Mode:</strong> Will send 8.8.8.8 (Google DNS, different ASN) instead of your real IP to trigger validation failure. Works with both strict and relaxed modes.</div>' : ''}
+    ${mismatchIp ? `<div class="warning">
+      <strong>⚠️ IP Mismatch Mode Active</strong><br>
+      Sending 8.8.8.8 (Google DNS, ASN 15169) instead of your real IP.<br><br>
+      <strong>Expected Result:</strong> 3 calls (strict → relaxed → off)<br>
+      • Call #1 (strict): FAIL - different exact IP<br>
+      • Call #2 (relaxed): FAIL - different ASN from yours<br>
+      • Call #3 (off): SUCCESS - token is valid<br><br>
+      <strong>To see 2-call scenario</strong> (strict fails, relaxed passes), you'd need to send an IP in your same subnet (e.g., if you're 192.168.1.100, send 192.168.1.200). This demo can't calculate that dynamically.
+    </div>` : ''}
 
     <div class="info" style="background: #e7f3ff; border-left-color: #0066cc; font-size: 14px;">
       <strong>What happens when you submit (Triple-Call Pattern):</strong><br>
