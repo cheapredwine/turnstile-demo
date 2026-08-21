@@ -573,7 +573,7 @@ Result: Both blocked (3 calls made)
     <div class="test-toggle">
       <strong>IP Mismatch Simulation:</strong><br><br>
       <label><input type="radio" name="mismatch" value="none" ${mismatchType === 'none' ? 'checked' : ''} onchange="updateMismatch()"> No mismatch (send real IP)</label><br>
-      <label><input type="radio" name="mismatch" value="subnet" ${mismatchType === 'subnet' ? 'checked' : ''} onchange="updateMismatch()"> Same subnet (your IP + 1) → expect 2 calls</label><br>
+      <label><input type="radio" name="mismatch" value="subnet" ${mismatchType === 'subnet' ? 'checked' : ''} onchange="updateMismatch()"> Same subnet (your IP + 1) → expect 2 calls (if same ASN)</label><br>
       <label><input type="radio" name="mismatch" value="asn" ${mismatchType === 'asn' ? 'checked' : ''} onchange="updateMismatch()"> Different ASN (8.8.8.8) → expect 3 calls</label>
     </div>
 
