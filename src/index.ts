@@ -19,16 +19,32 @@ export async function handleTurnstileVerification(
   request: Request, 
   env: Env, 
   modeOverride?: 'strict' | 'relaxed' | 'off' | null,
-  mismatchIp?: boolean,
+  mismatchType?: string,
   action?: string
 ): Promise<Response> {
   try {
     const formData = await request.formData();
     const token = formData.get('cf-turnstile-response') as string;
     const realClientIp = request.headers.get('CF-Connecting-IP') || '0.0.0.0';
-    // Use fake IP (Google DNS - definitely different ASN) to simulate mismatch
-    // 192.0.2.1 is TEST-NET-1 which relaxed mode may treat as private/special
-    const clientIp = mismatchIp ? '8.8.8.8' : realClientIp;
+    
+    // Calculate mismatched IP based on type
+    let clientIp = realClientIp;
+    let mismatchDescription = '';
+    
+    if (mismatchType === 'subnet') {
+      // Same subnet: increment last octet by 1
+      const parts = realClientIp.split('.');
+      if (parts.length === 4) {
+        const lastOctet = parseInt(parts[3]);
+        const newOctet = lastOctet === 255 ? 1 : lastOctet + 1;
+        clientIp = `${parts[0]}.${parts[1]}.${parts[2]}.${newOctet}`;
+        mismatchDescription = 'SAME SUBNET';
+      }
+    } else if (mismatchType === 'asn') {
+      // Different ASN: use Google DNS
+      clientIp = '8.8.8.8';
+      mismatchDescription = 'DIFFERENT ASN';
+    }
 
     if (!token) {
       return new Response('No Turnstile token provided', { status: 400 });
@@ -267,7 +283,7 @@ export async function handleTurnstileVerification(
     <div class="errors">
       <strong>Error codes:</strong> ${verificationResult["error-codes"].join(", ")}<br><br>
       <strong>Real Client IP:</strong> ${realClientIp}<br>
-      <strong>IP Sent to Verify:</strong> ${clientIp}${mismatchIp ? ' (MISMATCHED)' : ''}
+      <strong>IP Sent to Verify:</strong> ${clientIp}${mismatchDescription ? ` (${mismatchDescription})` : ''}
     </div>
     
     ${offResult ? `
@@ -332,7 +348,7 @@ export async function handleTurnstileVerification(
       <div><span class="label">Triple-Call Result:</span> Passed strict (stopped at call #1)</div>
       <div><span class="label">Duration:</span> ${duration1}ms</div>
       <div><span class="label">Real Client IP:</span> ${realClientIp}</div>
-      <div><span class="label">IP Sent to Verify:</span> ${clientIp}${mismatchIp ? ' (MISMATCHED)' : ''}</div>
+      <div><span class="label">IP Sent to Verify:</span> ${clientIp}${mismatchDescription ? ` (${mismatchDescription})` : ''}</div>
       <div><span class="label">Challenge TS:</span> ${verificationResult.challenge_ts || 'N/A'}</div>
       <div><span class="label">Hostname:</span> ${verificationResult.hostname || 'N/A'}</div>
     </div>
@@ -510,7 +526,7 @@ Result: Both blocked (3 calls made)
 
     if (url.pathname === '/form' && request.method === 'GET') {
       const mode = url.searchParams.get('mode') || env.REMOTEIP_LENIENCY || 'strict';
-      const mismatchIp = url.searchParams.get('mismatch') === 'true';
+      const mismatchType = url.searchParams.get('mismatch') || 'none'; // none, subnet, asn
       const action = url.searchParams.get('action') || 'allow';
       const formHtml = `
 <!DOCTYPE html>
@@ -549,13 +565,10 @@ Result: Both blocked (3 calls made)
     </div>
 
     <div class="test-toggle">
-      <label>
-        <input type="checkbox" id="mismatch" ${mismatchIp ? 'checked' : ''} onchange="updateMismatch()">
-        <strong>Simulate IP Mismatch</strong> (send 8.8.8.8 - different ASN, triggers both strict + relaxed failure)
-      </label>
-      <div style="font-size: 12px; color: #666; margin-top: 5px; margin-left: 25px;">
-        Note: Demonstrating strict-only failure (same ASN, different IP) requires knowing your subnet in advance, which we can't do client-side. With 8.8.8.8, you'll see the "both strict + relaxed blocked" scenario (3 calls).
-      </div>
+      <strong>IP Mismatch Simulation:</strong><br><br>
+      <label><input type="radio" name="mismatch" value="none" ${mismatchType === 'none' ? 'checked' : ''} onchange="updateMismatch()"> No mismatch (send real IP)</label><br>
+      <label><input type="radio" name="mismatch" value="subnet" ${mismatchType === 'subnet' ? 'checked' : ''} onchange="updateMismatch()"> Same subnet (your IP + 1) → expect 2 calls</label><br>
+      <label><input type="radio" name="mismatch" value="asn" ${mismatchType === 'asn' ? 'checked' : ''} onchange="updateMismatch()"> Different ASN (8.8.8.8) → expect 3 calls</label>
     </div>
 
     <div class="test-toggle">
@@ -564,14 +577,21 @@ Result: Both blocked (3 calls made)
       <label><input type="radio" name="action" value="block" ${action === 'block' ? 'checked' : ''} onchange="updateAction()"> Hard Block (reject - attacker knows immediately)</label>
     </div>
 
-    ${mismatchIp ? `<div class="warning">
-      <strong>⚠️ IP Mismatch Mode Active</strong><br>
+    ${mismatchType === 'subnet' ? `<div class="warning" style="background: #fff3cd;">
+      <strong>⚠️ Same Subnet Mismatch Mode</strong><br>
+      Sending (your IP + 1) instead of your real IP.<br><br>
+      <strong>Expected Result:</strong> 2 calls (strict → relaxed)<br>
+      • Call #1 (strict): FAIL - different exact IP<br>
+      • Call #2 (relaxed): SUCCESS - same subnet + likely same ASN ✓<br><br>
+      <strong>Note:</strong> Assumes +1 is in same /24 subnet and same ISP (usually true for residential IPs).
+    </div>` : ''}
+    ${mismatchType === 'asn' ? `<div class="warning" style="background: #ffe4e1;">
+      <strong>⚠️ Different ASN Mismatch Mode</strong><br>
       Sending 8.8.8.8 (Google DNS, ASN 15169) instead of your real IP.<br><br>
       <strong>Expected Result:</strong> 3 calls (strict → relaxed → off)<br>
       • Call #1 (strict): FAIL - different exact IP<br>
       • Call #2 (relaxed): FAIL - different ASN from yours<br>
-      • Call #3 (off): SUCCESS - token is valid<br><br>
-      <strong>To see 2-call scenario</strong> (strict fails, relaxed passes), you'd need to send an IP in your same subnet (e.g., if you're 192.168.1.100, send 192.168.1.200). This demo can't calculate that dynamically.
+      • Call #3 (off): SUCCESS - token is valid ✓
     </div>` : ''}
 
     <div class="info" style="background: #e7f3ff; border-left-color: #0066cc; font-size: 14px;">
@@ -588,7 +608,7 @@ Result: Both blocked (3 calls made)
     </div>
 
     <p>Complete the challenge and submit:</p>
-    <form method="POST" action="/form?mode=${mode}${mismatchIp ? '&mismatch=true' : ''}${action ? '&action=' + action : ''}">
+    <form method="POST" action="/form?mode=${mode}&mismatch=${mismatchType}&action=${action}">
       <div class="cf-turnstile" data-sitekey="${env.TURNSTILE_SITE_KEY}"></div>
       <br>
       <input type="submit" value="Verify Token">
@@ -597,9 +617,9 @@ Result: Both blocked (3 calls made)
   <script>
     function buildUrl() {
       const mode = document.querySelector('input[name="mode"]:checked').value;
-      const mismatch = document.getElementById('mismatch').checked;
+      const mismatch = document.querySelector('input[name="mismatch"]:checked').value;
       const action = document.querySelector('input[name="action"]:checked').value;
-      return '/form?mode=' + mode + (mismatch ? '&mismatch=true' : '') + '&action=' + action;
+      return '/form?mode=' + mode + '&mismatch=' + mismatch + '&action=' + action;
     }
     function updateMode(mode) {
       location.href = buildUrl();
@@ -622,9 +642,9 @@ Result: Both blocked (3 calls made)
 
     if (request.method === 'POST') {
       const mode = url.searchParams.get('mode') as 'strict' | 'relaxed' | 'off' | null;
-      const mismatchIp = url.searchParams.get('mismatch') === 'true';
+      const mismatchType = url.searchParams.get('mismatch') || 'none';
       const action = url.searchParams.get('action') || 'allow';
-      return handleTurnstileVerification(request, env, mode, mismatchIp, action);
+      return handleTurnstileVerification(request, env, mode, mismatchType, action);
     }
 
     return new Response('Method not allowed', { status: 405 });
