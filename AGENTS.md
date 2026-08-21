@@ -97,19 +97,34 @@ npm run deploy
 
 ## Implementation Details
 
-**siteverify call (line 112):**
+**Double-Call Pattern (src/index.ts:37-50):**
 ```typescript
-formData.append('remoteip_leniency', leniency);
+const verificationResult = await verifyTurnstileToken(token, clientIp, env, mode);
+
+// If first call failed with invalid-input-response, retry with 'off'
+if (!verificationResult.success && mode !== 'off' && 
+    verificationResult["error-codes"].includes("invalid-input-response")) {
+  const secondCallResult = await verifyTurnstileToken(token, clientIp, env, 'off');
+  if (secondCallResult.success) {
+    ipMismatchDetected = true; // First failed on IP, second succeeded
+  }
+}
 ```
 
-**Response handling:**
-- Success: HTML page with verification details + JSON in `<details>`
-- Error: HTML error page with error codes
-- All responses: UTF-8 charset header
+**Response types:**
+1. **Success** (200) - First call passed, no double-call needed
+2. **IP Mismatch Detected** (200) - First failed, second passed → flag but allow
+3. **Hard Failure** (401) - Both calls failed → token invalid (expired/reused/etc)
+
+**Important:**
+- Tokens consumed only on successful validation
+- Failed strict + successful off = safe, demonstrates IP mismatch
+- Default mode is `off` (not `strict` as previously thought)
+- `relaxed` checks ASN + subnet, not just exact IP
 
 **Test structure:**
 1. verifyTurnstileToken - API call formatting
-2. handleTurnstileVerification - Request handling
+2. handleTurnstileVerification - Request handling + double-call
 3. remoteip_leniency Parameter - All three modes
 4. Edge cases - Defaults, missing values, errors
 

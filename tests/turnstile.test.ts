@@ -129,11 +129,20 @@ describe('Turnstile Verification', () => {
         body: formData
       });
 
+      // First call fails with invalid-input-response
       mockFetch.mockResolvedValueOnce({
         json: async () => ({
           success: false,
           "error-codes": ['invalid-input-response'],
           "remoteip_leniency": "strict"
+        })
+      } as Response);
+
+      // Second call (double-call pattern with 'off') also fails - token genuinely invalid
+      mockFetch.mockResolvedValueOnce({
+        json: async () => ({
+          success: false,
+          "error-codes": ['invalid-input-response']
         })
       } as Response);
 

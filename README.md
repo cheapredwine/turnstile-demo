@@ -6,10 +6,20 @@ Cloudflare Worker demonstrating the undocumented `remoteip_leniency` parameter i
 
 ## What This Does
 
-Tests Turnstile's undocumented `remoteip_leniency` parameter with three modes:
-- `strict` - Enforce exact IP match (default)
-- `relaxed` - Allow IP variations 
-- `off` - Disable IP validation
+Demonstrates Turnstile's undocumented `remoteip_leniency` parameter + double-call workaround for detecting IP mismatches.
+
+**Modes:**
+- `off` (default) - No IP enforcement
+- `strict` - Exact IP match required (any mismatch = reject)
+- `relaxed` - Same ASN/subnet required (rejects different ASN, different subnet IPv4 /24 or IPv6 /64)
+
+**Problem:** When `strict`/`relaxed` blocks a token, error code is `invalid-input-response` (same as expired/reused tokens). No way to distinguish IP mismatch from other failures.
+
+**Solution:** Double-call pattern:
+1. Call with `strict` (or `relaxed`)
+2. If failed → retry same token with `off`
+3. If retry succeeds → IP mismatch detected (flag/allow)
+4. If retry fails → token invalid for other reason (reject)
 
 ## Quick Start
 
@@ -42,10 +52,14 @@ wrangler.toml             # Worker config
 
 ## How It Works
 
-1. Widget rendered at `/form` with managed Turnstile
-2. Form submits cf-turnstile-response token
-3. Worker calls siteverify API with `remoteip_leniency` parameter
-4. Response shows verification result + mode used
+1. Widget at `/form` (managed mode, 3 selectable modes + IP mismatch simulator)
+2. Form POST submits cf-turnstile-response token
+3. Worker calls siteverify with selected `remoteip_leniency`
+4. If first call fails with `invalid-input-response` → retry with `off` (double-call pattern)
+5. Response shows:
+   - Success (first call passed)
+   - IP Mismatch Detected (first failed, second passed)
+   - Hard Failure (both failed - token expired/reused/malformed)
 
 ### Run Tests in Watch Mode
 ```bash

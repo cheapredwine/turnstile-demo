@@ -32,7 +32,81 @@ export async function handleTurnstileVerification(
       return new Response('No Turnstile token provided', { status: 400 });
     }
 
-    const verificationResult = await verifyTurnstileToken(token, clientIp, env, modeOverride || undefined);
+    const mode = modeOverride || env.REMOTEIP_LENIENCY || 'strict';
+    
+    // First call with specified mode
+    const verificationResult = await verifyTurnstileToken(token, clientIp, env, mode);
+    let ipMismatchDetected = false;
+    let secondCallResult = null;
+
+    // Double-call workaround: if first call failed and mode wasn't 'off', retry with 'off'
+    if (!verificationResult.success && mode !== 'off' && 
+        verificationResult["error-codes"].includes("invalid-input-response")) {
+      secondCallResult = await verifyTurnstileToken(token, clientIp, env, 'off');
+      if (secondCallResult.success) {
+        // First call failed on IP enforcement, second succeeded without it
+        ipMismatchDetected = true;
+      }
+    }
+
+    // Handle IP mismatch detection (double-call succeeded on retry with 'off')
+    if (ipMismatchDetected && secondCallResult) {
+      const warningHtml = `
+<!DOCTYPE html>
+<html>
+<head>
+  <title>IP Mismatch Detected</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 700px; margin: 50px auto; padding: 20px; }
+    .warning { border: 2px solid #ffc107; padding: 20px; border-radius: 8px; background: #fff3cd; }
+    h2 { color: #856404; }
+    .result { background: #fff; padding: 15px; margin: 15px 0; border-radius: 4px; font-family: monospace; font-size: 14px; }
+    .label { font-weight: bold; color: #856404; }
+    .doubleCall { background: #f8f9fa; padding: 15px; margin: 15px 0; border-left: 4px solid #ffc107; }
+    a { display: inline-block; margin-top: 20px; color: #0056b3; }
+  </style>
+</head>
+<body>
+  <div class="warning">
+    <h2>⚠️ IP Mismatch Detected (Double-Call Pattern)</h2>
+    
+    <div class="doubleCall">
+      <strong>What happened:</strong><br>
+      1. First call with <code>${mode}</code> → failed (IP mismatch)<br>
+      2. Retry with <code>off</code> → succeeded (token valid, IP enforcement was the issue)
+    </div>
+
+    <div class="result">
+      <div><span class="label">First Call Mode:</span> ${mode}</div>
+      <div><span class="label">First Call Result:</span> FAILED (invalid-input-response)</div>
+      <div><span class="label">Second Call Mode:</span> off</div>
+      <div><span class="label">Second Call Result:</span> SUCCESS ✓</div>
+      <div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid #ddd;">
+        <span class="label">Real Client IP:</span> ${realClientIp}<br>
+        <span class="label">IP Sent to Verify:</span> ${clientIp}${mismatchIp ? ' (MISMATCHED)' : ''}<br>
+        <span class="label">Token:</span> Valid, but IP didn't match ${mode} policy
+      </div>
+    </div>
+
+    <p><strong>Decision point:</strong> Token is valid but IP changed. You can:</p>
+    <ul>
+      <li><strong>Allow + Flag:</strong> Let user through but log for review (this demo allows)</li>
+      <li><strong>Hard Block:</strong> Reject as suspicious (attacker knows they're detected)</li>
+    </ul>
+
+    <details>
+      <summary style="cursor: pointer;">Second Call Full Response</summary>
+      <pre style="background: #fff; padding: 10px; margin-top: 10px;">${JSON.stringify(secondCallResult, null, 2)}</pre>
+    </details>
+    
+    <a href="/form">← Try again</a>
+  </div>
+</body>
+</html>`;
+      return new Response(warningHtml, {
+        headers: { 'Content-Type': 'text/html; charset=utf-8' }
+      });
+    }
 
     if (!verificationResult.success) {
       const errorHtml = `
@@ -45,6 +119,7 @@ export async function handleTurnstileVerification(
     .error { border: 2px solid #dc3545; padding: 20px; border-radius: 8px; background: #f8d7da; }
     h2 { color: #dc3545; }
     .errors { background: #fff; padding: 10px; margin: 15px 0; border-radius: 4px; }
+    .doubleCall { background: #f8f9fa; padding: 10px; margin: 15px 0; border-left: 4px solid #dc3545; font-size: 14px; }
     a { display: inline-block; margin-top: 20px; color: #0056b3; }
   </style>
 </head>
@@ -53,12 +128,26 @@ export async function handleTurnstileVerification(
     <h2>❌ Verification Failed</h2>
     <div class="errors">
       <strong>Error codes:</strong> ${verificationResult["error-codes"].join(", ")}<br><br>
-      <strong>Mode Used:</strong> ${modeOverride || env.REMOTEIP_LENIENCY || 'strict'}<br>
+      <strong>Mode Used:</strong> ${mode}<br>
       <strong>Real Client IP:</strong> ${realClientIp}<br>
       <strong>IP Sent to Verify:</strong> ${clientIp}${mismatchIp ? ' (MISMATCHED)' : ''}
     </div>
+    
+    ${secondCallResult ? `
+    <div class="doubleCall">
+      <strong>Double-Call Pattern Result:</strong><br>
+      • First call with <code>${mode}</code> → failed<br>
+      • Second call with <code>off</code> → also failed<br>
+      • <strong>Conclusion:</strong> Token invalid for reasons other than IP (expired, reused, malformed, etc.)
+    </div>
+    <details>
+      <summary style="cursor: pointer;">Second Call Response</summary>
+      <pre style="background: #fff; padding: 10px; margin-top: 10px;">${JSON.stringify(secondCallResult, null, 2)}</pre>
+    </details>
+    ` : ''}
+
     <details style="margin-top: 15px;">
-      <summary style="cursor: pointer; color: #dc3545;">Full API Response</summary>
+      <summary style="cursor: pointer; color: #dc3545;">First Call Response</summary>
       <pre style="background: #fff; padding: 10px; margin-top: 10px; overflow-x: auto;">${JSON.stringify(verificationResult, null, 2)}</pre>
     </details>
     <a href="/form">← Try again</a>
@@ -89,7 +178,7 @@ export async function handleTurnstileVerification(
   <div class="success">
     <h2>✅ Turnstile Verification Successful</h2>
     <div class="result">
-      <div><span class="label">Mode Used:</span> ${modeOverride || env.REMOTEIP_LENIENCY || 'strict'}</div>
+      <div><span class="label">Mode Used:</span> ${mode} (first call only, no double-call needed)</div>
       <div><span class="label">Real Client IP:</span> ${realClientIp}</div>
       <div><span class="label">IP Sent to Verify:</span> ${clientIp}${mismatchIp ? ' (MISMATCHED)' : ''}</div>
       <div><span class="label">Challenge TS:</span> ${verificationResult.challenge_ts || 'N/A'}</div>
@@ -169,17 +258,30 @@ export default {
       <strong>Current Configuration:</strong> remoteip_leniency = "${leniencyMode}"
     </div>
     <h2>What is remoteip_leniency?</h2>
-    <p>An <strong>undocumented parameter</strong> for Turnstile's <code>/siteverify</code> API that controls how strictly the user's IP address is validated during token verification.</p>
+    <p>An <strong>undocumented parameter</strong> for Turnstile's <code>/siteverify</code> API that controls IP address validation strictness.</p>
     
-    <h3>Why It Matters</h3>
-    <p>When a user solves a Turnstile challenge, the token is tied to their IP address. If their IP changes between solving the challenge and your server validating it (due to mobile network handoffs, VPN switches, or proxy rotation), validation may fail.</p>
-
     <h3>The Three Modes</h3>
     <ul>
-      <li><code>strict</code> - Requires <strong>exact IP match</strong>. Use for high-security scenarios where you need certainty that the same device/network verified the token.</li>
-      <li><code>relaxed</code> - Allows <strong>IP variations within reason</strong> (same /24 subnet, ASN changes, mobile carrier transitions). Best for mobile apps and users on dynamic IPs.</li>
-      <li><code>off</code> - <strong>Disables IP validation entirely</strong>. Only verifies the token itself. Use cautiously—reduces bot detection effectiveness.</li>
+      <li><code>off</code> (default) - <strong>No IP enforcement.</strong> Token validated on all other criteria only.</li>
+      <li><code>strict</code> - <strong>Exact IP match required.</strong> Rejects if remote IP ≠ token solve IP. Any mismatch = rejection.</li>
+      <li><code>relaxed</code> - <strong>Same ASN/subnet required.</strong> Rejects if different ASN, different subnet (IPv4 /24, IPv6 /64), or invalid IP. Allows same-ASN changes, IPv4↔IPv6 cross-family (same ASN), private/loopback IPs.</li>
     </ul>
+
+    <h3>The Problem: No IP Mismatch Signal</h3>
+    <p>When <code>strict</code> or <code>relaxed</code> blocks a token due to IP mismatch, the response is:</p>
+    <pre>{ "success": false, "error-codes": ["invalid-input-response"] }</pre>
+    <p>This is the <strong>same error code</strong> as expired tokens, reused tokens, malformed tokens. <strong>You can't tell if it was an IP mismatch or something else.</strong></p>
+
+    <h3>The Double-Call Workaround</h3>
+    <p>Detect IP mismatches by calling siteverify twice:</p>
+    <pre>1. Call with remoteip_leniency: "strict" (or "relaxed")
+   → If success: true → allow (IP matched)
+   → If success: false:
+
+2. Retry SAME token with remoteip_leniency: "off"
+   → If success: true → IP mismatch detected! (flag/allow)
+   → If success: false → token invalid for other reason (reject)</pre>
+    <p><strong>Note:</strong> Tokens are consumed only on successful validation, so a failed strict call + successful off call works. This demo implements the double-call pattern.</p>
 
     <h3>How to Use It</h3>
     <p>Add the parameter when calling Turnstile's siteverify endpoint:</p>
