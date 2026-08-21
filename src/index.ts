@@ -6,13 +6,6 @@ interface TurnstileVerifyResponse {
   challenge_ts?: string;
   hostname?: string;
   "remoteip_leniency"?: string;
-  ip_comparison_metadata?: {
-    matched?: boolean;
-    original_ip?: string;
-    verification_ip?: string;
-    comparison_method?: string;
-    [key: string]: any;
-  };
 }
 
 interface Env {
@@ -25,12 +18,15 @@ interface Env {
 export async function handleTurnstileVerification(
   request: Request, 
   env: Env, 
-  modeOverride?: 'strict' | 'relaxed' | 'off' | null
+  modeOverride?: 'strict' | 'relaxed' | 'off' | null,
+  mismatchIp?: boolean
 ): Promise<Response> {
   try {
     const formData = await request.formData();
     const token = formData.get('cf-turnstile-response') as string;
-    const clientIp = request.headers.get('CF-Connecting-IP') || '0.0.0.0';
+    const realClientIp = request.headers.get('CF-Connecting-IP') || '0.0.0.0';
+    // Use fake IP (TEST-NET-1 from RFC 5737) to simulate mismatch
+    const clientIp = mismatchIp ? '192.0.2.1' : realClientIp;
 
     if (!token) {
       return new Response('No Turnstile token provided', { status: 400 });
@@ -56,8 +52,15 @@ export async function handleTurnstileVerification(
   <div class="error">
     <h2>❌ Verification Failed</h2>
     <div class="errors">
-      <strong>Error codes:</strong> ${verificationResult["error-codes"].join(", ")}
+      <strong>Error codes:</strong> ${verificationResult["error-codes"].join(", ")}<br><br>
+      <strong>Mode Used:</strong> ${modeOverride || env.REMOTEIP_LENIENCY || 'strict'}<br>
+      <strong>Real Client IP:</strong> ${realClientIp}<br>
+      <strong>IP Sent to Verify:</strong> ${clientIp}${mismatchIp ? ' (MISMATCHED)' : ''}
     </div>
+    <details style="margin-top: 15px;">
+      <summary style="cursor: pointer; color: #dc3545;">Full API Response</summary>
+      <pre style="background: #fff; padding: 10px; margin-top: 10px; overflow-x: auto;">${JSON.stringify(verificationResult, null, 2)}</pre>
+    </details>
     <a href="/form">← Try again</a>
   </div>
 </body>
@@ -87,10 +90,10 @@ export async function handleTurnstileVerification(
     <h2>✅ Turnstile Verification Successful</h2>
     <div class="result">
       <div><span class="label">Mode Used:</span> ${modeOverride || env.REMOTEIP_LENIENCY || 'strict'}</div>
-      <div><span class="label">Client IP:</span> ${clientIp}</div>
+      <div><span class="label">Real Client IP:</span> ${realClientIp}</div>
+      <div><span class="label">IP Sent to Verify:</span> ${clientIp}${mismatchIp ? ' (MISMATCHED)' : ''}</div>
       <div><span class="label">Challenge TS:</span> ${verificationResult.challenge_ts || 'N/A'}</div>
       <div><span class="label">Hostname:</span> ${verificationResult.hostname || 'N/A'}</div>
-      ${verificationResult.ip_comparison_metadata ? `<div><span class="label">IP Comparison:</span> ${JSON.stringify(verificationResult.ip_comparison_metadata)}</div>` : ''}
     </div>
     <details>
       <summary style="cursor: pointer; color: #0056b3;">Full API Response</summary>
@@ -204,6 +207,7 @@ const result = await fetch(
 
     if (url.pathname === '/form' && request.method === 'GET') {
       const mode = url.searchParams.get('mode') || env.REMOTEIP_LENIENCY || 'strict';
+      const mismatchIp = url.searchParams.get('mismatch') === 'true';
       const formHtml = `
 <!DOCTYPE html>
 <html>
@@ -217,9 +221,12 @@ const result = await fetch(
     input[type="submit"]:hover { background: #004494; }
     .cf-turnstile { margin: 20px 0; }
     .info { background: #f0f8ff; padding: 10px; margin-bottom: 20px; border-left: 4px solid #0056b3; }
+    .warning { background: #fff3cd; padding: 10px; margin-bottom: 20px; border-left: 4px solid #ffc107; }
     .mode-toggle { margin: 15px 0; padding: 10px; background: #fff; border: 1px solid #ddd; border-radius: 4px; }
     .mode-toggle label { margin-right: 15px; cursor: pointer; }
     .mode-toggle input[type="radio"] { margin-right: 5px; }
+    .test-toggle { margin: 15px 0; padding: 10px; background: #fff; border: 1px solid #ddd; border-radius: 4px; }
+    .test-toggle input[type="checkbox"] { margin-right: 5px; }
   </style>
 </head>
 <body>
@@ -232,18 +239,38 @@ const result = await fetch(
     
     <div class="mode-toggle">
       <strong>Select Mode:</strong><br><br>
-      <label><input type="radio" name="mode" value="strict" ${mode === 'strict' ? 'checked' : ''} onchange="location.href='/form?mode=strict'"> strict</label>
-      <label><input type="radio" name="mode" value="relaxed" ${mode === 'relaxed' ? 'checked' : ''} onchange="location.href='/form?mode=relaxed'"> relaxed</label>
-      <label><input type="radio" name="mode" value="off" ${mode === 'off' ? 'checked' : ''} onchange="location.href='/form?mode=off'"> off</label>
+      <label><input type="radio" name="mode" value="strict" ${mode === 'strict' ? 'checked' : ''} onchange="updateMode('strict')"> strict</label>
+      <label><input type="radio" name="mode" value="relaxed" ${mode === 'relaxed' ? 'checked' : ''} onchange="updateMode('relaxed')"> relaxed</label>
+      <label><input type="radio" name="mode" value="off" ${mode === 'off' ? 'checked' : ''} onchange="updateMode('off')"> off</label>
     </div>
 
+    <div class="test-toggle">
+      <label>
+        <input type="checkbox" id="mismatch" ${mismatchIp ? 'checked' : ''} onchange="updateMismatch()">
+        <strong>Simulate IP Mismatch</strong> (send wrong IP to demonstrate failure)
+      </label>
+    </div>
+
+    ${mismatchIp ? '<div class="warning"><strong>⚠️ IP Mismatch Mode:</strong> Will send 192.0.2.1 instead of your real IP to trigger validation failure. Use this to see how each mode handles mismatches.</div>' : ''}
+
     <p>Complete the challenge and submit to verify with remoteip_leniency="${mode}"</p>
-    <form method="POST" action="/form?mode=${mode}">
+    <form method="POST" action="/form?mode=${mode}${mismatchIp ? '&mismatch=true' : ''}">
       <div class="cf-turnstile" data-sitekey="${env.TURNSTILE_SITE_KEY}"></div>
       <br>
       <input type="submit" value="Verify Token">
     </form>
   </div>
+  <script>
+    function updateMode(mode) {
+      const mismatch = document.getElementById('mismatch').checked;
+      location.href = '/form?mode=' + mode + (mismatch ? '&mismatch=true' : '');
+    }
+    function updateMismatch() {
+      const mismatch = document.getElementById('mismatch').checked;
+      const mode = document.querySelector('input[name="mode"]:checked').value;
+      location.href = '/form?mode=' + mode + (mismatch ? '&mismatch=true' : '');
+    }
+  </script>
 </body>
 </html>
       `;
@@ -255,7 +282,8 @@ const result = await fetch(
 
     if (request.method === 'POST') {
       const mode = url.searchParams.get('mode') as 'strict' | 'relaxed' | 'off' | null;
-      return handleTurnstileVerification(request, env, mode);
+      const mismatchIp = url.searchParams.get('mismatch') === 'true';
+      return handleTurnstileVerification(request, env, mode, mismatchIp);
     }
 
     return new Response('Method not allowed', { status: 405 });
