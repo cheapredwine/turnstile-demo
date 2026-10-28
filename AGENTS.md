@@ -2,26 +2,30 @@
 
 ## Project Overview
 
-Cloudflare Worker demonstrating the undocumented `remoteip_leniency` parameter in the Turnstile siteverify API, using **staged enforcement** (starting level + fallback cascade) to classify IP mismatches.
+Cloudflare Worker demonstrating the undocumented `remoteip_leniency` parameter in the Turnstile siteverify API, using **staged enforcement** (starting level + fallback cascade) to classify IP mismatches — served from both a custom domain on the `jsherron.com` zone (with live Cloudflare **Precursor** in front) and the Access-gated workers.dev URL.
 
-**Live:** https://turnstile-demo.jsherron-test-account.workers.dev (behind Cloudflare Access)
+**Live:**
+- https://turnstile-demo.jsherron.com (custom domain; Access-gated; Precursor interstitial for session-less visitors)
+- https://turnstile-demo.jsherron-test-account.workers.dev (Access-gated)
 
 ## Architecture
 
 ```
-GET /          → Project overview + starting enforcement level
+GET /          → Project overview + Precursor explainer + starting level
 GET /form      → Turnstile widget (managed mode) + option selectors
 POST /form     → Token validation via staged enforcement
 ```
 
 ## Key Files
 
-**src/index.ts** (838 lines)
+**src/index.ts** (913 lines)
 - `verifyTurnstileToken()` — siteverify call with `remoteip_leniency`; hardened (10s timeout, `response.ok` check, payload shape validation, fail-closed on transport/HTTP errors, `remoteip` omitted when client IP unknown)
 - `handleTurnstileVerification()` — allowlist-validates mode/mismatch/action params, token length ≤ 2048, runs the staged cascade, applies the canonical gate, renders result pages (all dynamic values HTML-escaped)
 - Canonical gate on the successful result — `action` must equal the widget's `data-action` (`form`); hostname must be in `TURNSTILE_HOSTNAMES` allowlist when set (fail closed → 401)
 - `simulateIpMismatch()` — subnet (last octet +1, IPv4 only) and ASN (8.8.8.8) simulation; IPv6 visitors get their real IP unchanged plus an explanatory note
 - Structured `console.error` JSON logging on siteverify transport failures and handler errors (no tokens/secrets logged)
+- Provenance footer on all pages: "Served by Cloudflare · colo · Ray ID" (`request.cf.colo` / `CF-Ray`) + links to Precursor docs and the Precursor Trace simulation
+- Index page carries a full Precursor explainer: how it works (injected script, continuous loop, `cf_clearance` session state in Arm mode), Off/Monitor/Arm modes table, the Interstitial + Interstitial Rules model, and JSD supersession
 - Four result pages: success (passed at starting level + gate), IP mismatch (fallback passed; classify + allow/block), hard failure (all levels failed or gate rejected)
 
 **tests/turnstile.test.ts** (540 lines)
@@ -30,10 +34,23 @@ POST /form     → Token validation via staged enforcement
 
 **wrangler.jsonc**
 - Site key: `0x4AAAAAAEX-IyAE9Fs2oLZ0` (managed widget)
+- Custom domain route: `turnstile-demo.jsherron.com` (`custom_domain: true`) + `workers_dev: true`
 - `REMOTEIP_LENIENCY` env var = starting enforcement level (strict/relaxed/off)
-- `TURNSTILE_HOSTNAMES` var = siteverify hostname allowlist (mirrors widget domain whitelist)
+- `TURNSTILE_HOSTNAMES` var = siteverify hostname allowlist (5 entries mirroring the widget whitelist)
 - Secret: `TURNSTILE_SECRET` via wrangler secrets; local dev via `.dev.vars` (see `.dev.vars.example`)
-- `nodejs_compat` flag, `[observability] enabled` with `head_sampling_rate: 1`, compatibility_date 2026-08-20
+- `nodejs_compat` flag, `[observability] enabled` with `head_sampling_rate: 1`, compatibility_date 2026-10-01
+
+**Zone integration (jsherron.com, zone id [removed])**
+- Precursor config via `PUT /zones/{zone_id}/precursor` (legacy shape — the portal tool
+  wrapper cannot send the `Cloudflare-Version: 1.0` header, so `mode`/`rules`/`show_interstitial`
+  are rejected; use legacy `default_mode` ∈ off|min-friction|max-security and
+  `enforcement_rules[{expression, mode, description?, enabled?}]`)
+- Current zone state: sitewide `min-friction` (interstitial off) + one enforcement rule
+  `http.host eq "turnstile-demo.jsherron.com"` → `max-security` (id `084dfe0da3d646c5a1bdf7b870b25db8`)
+- Detection **Status** (Off/Monitor/Arm) is v1.0-only — confirm/set it in the dashboard
+  (Security → Settings → Precursor); Monitor is the intended safe state
+- Rollback: `~/.opencode/plan/turnstile-precursor.md` (zone rule → widget whitelist →
+  worker config/deploy → git revert)
 
 ## Commands
 
@@ -131,3 +148,4 @@ Hostile values are never echoed — invalid params fall back to defaults (XSS re
 **Status:** production-ready demo, 44/44 tests passing, typecheck + lint clean
 **Last Updated:** 2026-10-28
 **Account:** JSherron Test Account ([removed])
+**Zone:** jsherron.com ([removed]) — Precursor live per plan rollback doc

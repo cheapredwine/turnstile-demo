@@ -5,6 +5,14 @@
   "compatibility_date": "2026-10-01",
   "compatibility_flags": ["nodejs_compat"],
 
+  // Custom domain on the jsherron.com zone (required for Precursor, which is zone-level).
+  // Rollback: remove this block and redeploy, then delete the leftover DNS record if any.
+  "routes": [{ "pattern": "turnstile-demo.jsherron.com", "custom_domain": true }],
+
+  // Keep the Access-gated workers.dev URL alongside the custom domain
+  // (adding a custom domain disables workers.dev by default).
+  "workers_dev": true,
+
   "observability": {
     "enabled": true,
     "head_sampling_rate": 1
@@ -25,7 +33,8 @@
 
     // Optional siteverify hostname allowlist (mirrors the widget's domain whitelist).
     // If you fork this demo into a real production backend, drop localhost/127.0.0.1.
-    "TURNSTILE_HOSTNAMES": "turnstile-demo.jsherron-test-account.workers.dev, jsherron.com, localhost, 127.0.0.1"
+    "TURNSTILE_HOSTNAMES":
+      "turnstile-demo.jsherron-test-account.workers.dev, turnstile-demo.jsherron.com, jsherron.com, localhost, 127.0.0.1",
   }
 
   // Note: TURNSTILE_SECRET is stored via `wrangler secret put TURNSTILE_SECRET`.

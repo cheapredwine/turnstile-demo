@@ -221,6 +221,30 @@ function errorCodes(result: TurnstileVerifyResponse): string[] {
   return result["error-codes"] ?? [];
 }
 
+interface Provenance {
+  colo: string;
+  ray: string;
+}
+
+function getProvenance(request: Request): Provenance {
+  return {
+    colo: typeof request.cf?.colo === "string" ? request.cf.colo : "unknown",
+    ray: request.headers.get("CF-Ray") ?? "unknown"
+  };
+}
+
+function renderPageFooter(prov: Provenance): string {
+  return `
+  <footer class="cf-footer">
+    <div>Served by Cloudflare · colo <strong>${escapeHtml(prov.colo)}</strong> · Ray ID <code>${escapeHtml(prov.ray)}</code></div>
+    <div>
+      Cloudflare <a href="https://developers.cloudflare.com/cloudflare-challenges/precursor/">Precursor</a>
+      · <a href="https://blog.cloudflare.com/good-and-bad-agentic-behaviors">Precursor Trace simulation</a>
+      · <a href="https://developers.cloudflare.com/turnstile/">Turnstile docs</a>
+    </div>
+  </footer>`;
+}
+
 function renderCallTimeline(calls: CallRecord[], token: string, sentIp: string | null): string {
   return calls
     .map((call, index) => {
@@ -291,7 +315,7 @@ interface PageContext {
   mismatchDescription: string;
 }
 
-function renderSuccessPage(calls: CallRecord[], ctx: PageContext): string {
+function renderSuccessPage(calls: CallRecord[], ctx: PageContext, prov: Provenance): string {
   const first = calls[0];
   return `
 <!DOCTYPE html>
@@ -340,11 +364,17 @@ function renderSuccessPage(calls: CallRecord[], ctx: PageContext): string {
     ${renderResponseDetails(calls)}
     <a href="/form">← Try again</a>
   </div>
+  ${renderPageFooter(prov)}
 </body>
 </html>`;
 }
 
-function renderMismatchPage(calls: CallRecord[], ctx: PageContext, action: MismatchAction): string {
+function renderMismatchPage(
+  calls: CallRecord[],
+  ctx: PageContext,
+  action: MismatchAction,
+  prov: Provenance,
+): string {
   const shouldBlock = action === "block";
   const passedLevel = calls.find((call) => call.result.success)?.level ?? "off";
   return `
@@ -427,6 +457,7 @@ function renderMismatchPage(calls: CallRecord[], ctx: PageContext, action: Misma
     ${renderResponseDetails(calls)}
     <a href="/form">← Try again</a>
   </div>
+  ${renderPageFooter(prov)}
 </body>
 </html>`;
 }
@@ -435,6 +466,7 @@ function renderFailurePage(
   calls: CallRecord[],
   ctx: PageContext,
   syntheticCodes: string[] = [],
+  prov?: Provenance,
 ): string {
   const last = calls[calls.length - 1];
   const lastResult = last.result;
@@ -499,6 +531,7 @@ function renderFailurePage(
     ${renderResponseDetails(calls)}
     <a href="/form">← Try again</a>
   </div>
+  ${prov ? renderPageFooter(prov) : ""}
 </body>
 </html>`;
 }
@@ -567,18 +600,18 @@ export async function handleTurnstileVerification(
     }
 
     if (first.result.success && !gateCode) {
-      return htmlResponse(200, renderSuccessPage(calls, ctx), STATIC_PAGE_CSP);
+      return htmlResponse(200, renderSuccessPage(calls, ctx, getProvenance(request)), STATIC_PAGE_CSP);
     }
     if (passed && !gateCode) {
       return htmlResponse(
         action === "block" ? 401 : 200,
-        renderMismatchPage(calls, ctx, action),
+        renderMismatchPage(calls, ctx, action, getProvenance(request)),
         STATIC_PAGE_CSP,
       );
     }
     return htmlResponse(
       401,
-      renderFailurePage(calls, ctx, gateCode ? [gateCode] : []),
+      renderFailurePage(calls, ctx, gateCode ? [gateCode] : [], getProvenance(request)),
       STATIC_PAGE_CSP,
     );
   } catch (error) {
@@ -611,9 +644,12 @@ const BASE_STYLES = `
     th, td { border: 1px solid #ddd; padding: 8px 12px; text-align: left; font-size: 14px; }
     th { background: #f0f8ff; }
     em { color: #666; }
+    .cf-footer { margin-top: 30px; padding-top: 15px; border-top: 1px solid #ddd; color: #6c757d; font-size: 13px; }
+    .cf-footer div { margin: 4px 0; }
+    .cf-footer a { color: #0056b3; }
 `;
 
-function renderIndexPage(startLevel: LeniencyMode): string {
+function renderIndexPage(startLevel: LeniencyMode, prov: Provenance): string {
   return `
 <!DOCTYPE html>
 <html>
@@ -688,8 +724,43 @@ const result = await fetch(
       <li>⚠️ <code>remoteip_leniency</code> is <strong>undocumented</strong> and may change or disappear without notice.</li>
     </ul>
 
+    <h2>Cloudflare Precursor: continuous session-level verification</h2>
+    <p>Turnstile is <strong>point-in-time</strong> verification — one token, one siteverify call.
+      <a href="https://developers.cloudflare.com/cloudflare-challenges/precursor/">Precursor</a> is the
+      complementary <strong>continuous</strong> layer: client-side, session-based bot detection that
+      <em>supersedes JavaScript Detections (JSD)</em>.</p>
+
+    <h3>How it works</h3>
+    <ul>
+      <li>Cloudflare injects a client-side script into pages on the zone.</li>
+      <li>The script continuously collects behavioral signals; each execution is evaluated by Cloudflare.</li>
+      <li>In <strong>Arm</strong> mode, results update session state stored in the <code>cf_clearance</code> cookie.</li>
+    </ul>
+
+    <h3>Modes</h3>
+    <table>
+      <tr><th>Mode</th><th>Behavior</th></tr>
+      <tr><td><strong>Off</strong></td><td>Precursor does not run.</td></tr>
+      <tr><td><strong>Monitor</strong></td><td>Collects signals. Does <em>not</em> change bot score or challenge clearance.</td></tr>
+      <tr><td><strong>Arm</strong></td><td>Signals can affect bot score and challenge clearance (and disable JSD).</td></tr>
+    </table>
+
+    <h3>The Precursor Interstitial</h3>
+    <p>A lightweight challenge shown to visitors <em>without a verified Precursor session</em> before they
+      continue. Solving it establishes the verified session and grants challenge clearance. The sitewide
+      <strong>Show Interstitial</strong> default plus <strong>Interstitial Rules</strong> control where it appears —
+      the documented pattern is "off across most of the site, required on sensitive paths".</p>
+
+    <div class="info">
+      <strong>This demo runs Precursor live:</strong> <em>Monitor</em> mode on the <code>jsherron.com</code> zone,
+      sitewide interstitial <em>off</em>, and one Interstitial Rule scoped to this hostname — visitors without a
+      verified session meet Cloudflare's interstitial <em>before</em> this page, while the rest of the zone is
+      untouched. Once verified, Precursor keeps evaluating the session in the background.
+    </div>
+
     <a href="/form" class="btn">Try the Demo →</a>
   </div>
+  ${renderPageFooter(prov)}
 </body>
 </html>`;
 }
@@ -699,6 +770,7 @@ function renderFormPage(
   mode: LeniencyMode,
   mismatch: MismatchMode,
   action: MismatchAction,
+  prov: Provenance,
 ): string {
   const subnetNote =
     mismatch === "subnet"
@@ -779,6 +851,7 @@ function renderFormPage(
       <input type="submit" value="Verify Token">
     </form>
   </div>
+  ${renderPageFooter(prov)}
   <script>
     function buildUrl() {
       const mode = document.querySelector('input[name="mode"]:checked').value;
@@ -799,9 +872,11 @@ export default {
     const url = new URL(request.url);
     const pathname = url.pathname;
 
+    const prov = getProvenance(request);
+
     if (pathname === "/" && (request.method === "GET" || request.method === "HEAD")) {
       const startLevel = isLeniencyMode(env.REMOTEIP_LENIENCY) ? env.REMOTEIP_LENIENCY : "strict";
-      return htmlResponse(200, renderIndexPage(startLevel), STATIC_PAGE_CSP);
+      return htmlResponse(200, renderIndexPage(startLevel, prov), STATIC_PAGE_CSP);
     }
 
     if (pathname === "/form") {
@@ -817,7 +892,7 @@ export default {
         const action = isMismatchAction(actionParam) ? actionParam : "allow";
         return htmlResponse(
           200,
-          renderFormPage(env.TURNSTILE_SITE_KEY, mode, mismatch, action),
+          renderFormPage(env.TURNSTILE_SITE_KEY, mode, mismatch, action, prov),
           FORM_PAGE_CSP,
         );
       }

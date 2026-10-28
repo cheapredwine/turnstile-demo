@@ -6,7 +6,9 @@
 
 Cloudflare Worker demonstrating the undocumented `remoteip_leniency` parameter in Turnstile's siteverify API, using **staged enforcement** to classify IP mismatches.
 
-**Live Demo:** https://turnstile-demo.jsherron-test-account.workers.dev — protected by Cloudflare Access (authorized visitors only)
+**Live Demo (both hostnames serve the same worker):**
+- https://turnstile-demo.jsherron.com — custom domain on the `jsherron.com` zone, **behind Cloudflare Access** and fronted by the **Cloudflare Precursor interstitial** for session-less visitors
+- https://turnstile-demo.jsherron-test-account.workers.dev — workers.dev URL, behind Cloudflare Access
 
 ## What This Does
 
@@ -47,10 +49,12 @@ npm run deploy     # Deploy to Workers (wrangler deploy)
 
 **wrangler.jsonc:**
 ```jsonc
+"routes": [{ "pattern": "turnstile-demo.jsherron.com", "custom_domain": true }],
+"workers_dev": true,
 "vars": {
   "TURNSTILE_SITE_KEY": "0x4AAAAAAEX-IyAE9Fs2oLZ0",  // Public key
   "REMOTEIP_LENIENCY": "strict",                     // Starting enforcement level
-  "TURNSTILE_HOSTNAMES": "turnstile-demo.jsherron-test-account.workers.dev, jsherron.com, localhost, 127.0.0.1"
+  "TURNSTILE_HOSTNAMES": "turnstile-demo.jsherron-test-account.workers.dev, turnstile-demo.jsherron.com, jsherron.com, localhost, 127.0.0.1"
 }
 ```
 
@@ -73,7 +77,7 @@ wrangler.jsonc             # Worker config
 
 ## Endpoints
 
-**GET /** — project overview + current starting level
+**GET /** — project overview + Precursor explainer + starting level (footer shows colo + Ray ID)
 **GET /form** — Turnstile widget (managed mode) with selectors for starting level, IP-mismatch simulation, and mismatch action
 **POST /form** — validates the token via staged enforcement, returns an HTML result page
 
@@ -95,12 +99,35 @@ wrangler.jsonc             # Worker config
 
 Widget works on these domains (configured via wrangler CLI):
 ```bash
-wrangler turnstile widget update 0x4AAAAAAEX-IyAE9Fs2oLZ0 \
+wrangler turnstile widget update 0x4AAAAAAEX-IyAE9Fs2oLZ0 --mode managed \
   --domain localhost \
   --domain 127.0.0.1 \
   --domain jsherron.com \
-  --domain "turnstile-demo.jsherron-test-account.workers.dev"
+  --domain "turnstile-demo.jsherron-test-account.workers.dev" \
+  --domain "turnstile-demo.jsherron.com"
 ```
+(PUT semantics — pass the complete list.)
+
+## Cloudflare Precursor on This Demo
+
+This demo runs on the `jsherron.com` zone so **Precursor** (client-side, session-based bot
+detection that supersedes JavaScript Detections) is live in front of it:
+
+- **Custom domain:** `turnstile-demo.jsherron.com` (attached via `routes` in `wrangler.jsonc`;
+  `workers_dev: true` keeps the workers.dev URL alongside it)
+- **Zone config** (zone `jsherron.com`, Security → Settings → Precursor):
+  - Sitewide default `min-friction` (Show Interstitial **Off**) — untouched zone-wide
+  - One **enforcement rule** scoped to `http.host eq "turnstile-demo.jsherron.com"` with
+    `max-security` (interstitial required for visitors without a verified Precursor session)
+  - Detection **Status** (Off/Monitor/Arm): confirm in the dashboard — the legacy API shape
+    doesn't expose it; Monitor is the intended safe state
+- **What a visitor sees:** Access login (both hostnames) → Precursor interstitial (first
+  session-less visit to the custom domain) → the demo. Session verified → subsequent visits
+  go straight through.
+- **Where to observe:** Security → Analytics → Traffic → Bot analysis shows Precursor
+  detections once it runs on the zone.
+- **Rollback:** see `~/.opencode/plan/turnstile-precursor.md` — zone rule first, then widget
+  whitelist, then worker config/deploy.
 
 ## Testing Different Starting Levels
 
