@@ -1,0 +1,19 @@
+worker-configuration.d.ts
+  s_8ec2aeca2a543d::t_094c72ef616419 2,7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8c2ed98573686f1c900764e41d44c19d3a9797fb",
+  "prompts": {},
+  "sessions": {
+    "s_8ec2aeca2a543d": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e7bd90a05ffeoW3ueIuzV6mc7Z",
+        "model": "unknown"
+      },
+      "human_author": "Jason Sherron <jsherron@cloudflare.com>"
+    }
+  }
+}
