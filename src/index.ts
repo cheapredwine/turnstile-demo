@@ -1,102 +1,353 @@
-// Turnstile Demo Worker with remoteip_leniency parameter
+// Turnstile Demo Worker: remoteip_leniency with staged enforcement
+//
+// The siteverify `remoteip_leniency` parameter is undocumented. This demo treats the
+// selected/env-configured mode as the STARTING enforcement level and falls back through
+// progressively looser levels (strict → relaxed → off) when a call fails specifically on
+// IP grounds ("invalid-input-response"). Failed IP checks do not consume the token; the
+// first successful call does. This makes the failure classification observable:
+//   - passed at the starting level  → no IP mismatch
+//   - passed at a later level       → mismatch detected (earlier levels would have blocked)
+//   - all levels failed             → token invalid for other reasons (expired/reused/etc.)
+
+export type LeniencyMode = "strict" | "relaxed" | "off";
+type MismatchMode = "none" | "subnet" | "asn";
+type MismatchAction = "allow" | "block";
+
+const SITEVERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+const SITEVERIFY_TIMEOUT_MS = 10_000;
+const MAX_TOKEN_LENGTH = 2048;
+const ASN_MISMATCH_IP = "8.8.8.8";
+/** Canonical siteverify gate: the widget embeds data-action="form"; tokens must carry it. */
+const EXPECTED_ACTION = "form";
+
+// Result pages are static HTML (no external scripts) — lock them down hard.
+const STATIC_PAGE_CSP =
+  "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'self'";
+// The form page loads the Turnstile script + widget iframe and uses inline styles/scripts.
+const FORM_PAGE_CSP =
+  "default-src 'self'; " +
+  "script-src 'self' 'unsafe-inline' https://challenges.cloudflare.com; " +
+  "style-src 'self' 'unsafe-inline'; " +
+  "frame-src https://challenges.cloudflare.com; " +
+  "connect-src 'self' https://challenges.cloudflare.com; " +
+  "base-uri 'self'; form-action 'self'";
 
 interface TurnstileVerifyResponse {
   success: boolean;
   "error-codes": string[];
   challenge_ts?: string;
   hostname?: string;
-  "remoteip_leniency"?: string;
+  action?: string;
+  remoteip_leniency?: string;
 }
 
-interface Env {
+export interface Env {
   TURNSTILE_SECRET: string;
   TURNSTILE_SITE_KEY: string;
-  REMOTEIP_LENIENCY?: 'strict' | 'relaxed' | 'off';
-  TURNSTILE_CACHE?: KVNamespace;
+  REMOTEIP_LENIENCY?: LeniencyMode;
+  /** Optional comma-separated hostname allowlist checked against siteverify's `hostname`. Unset = no enforcement. */
+  TURNSTILE_HOSTNAMES?: string;
 }
 
-export async function handleTurnstileVerification(
-  request: Request, 
-  env: Env, 
-  modeOverride?: 'strict' | 'relaxed' | 'off' | null,
-  mismatchType?: string,
-  action?: string
-): Promise<Response> {
-  try {
-    const formData = await request.formData();
-    const token = formData.get('cf-turnstile-response') as string;
-    const realClientIp = request.headers.get('CF-Connecting-IP') || '0.0.0.0';
-    
-    // Calculate mismatched IP based on type
-    let clientIp = realClientIp;
-    let mismatchDescription = '';
-    
-    if (mismatchType === 'subnet') {
-      // Same subnet: increment last octet by 1
-      const parts = realClientIp.split('.');
-      if (parts.length === 4) {
-        const lastOctet = parseInt(parts[3]);
-        const newOctet = lastOctet === 255 ? 1 : lastOctet + 1;
-        clientIp = `${parts[0]}.${parts[1]}.${parts[2]}.${newOctet}`;
-        mismatchDescription = 'SAME SUBNET';
-      }
-    } else if (mismatchType === 'asn') {
-      // Different ASN: use Google DNS
-      clientIp = '8.8.8.8';
-      mismatchDescription = 'DIFFERENT ASN';
-    }
+interface CallRecord {
+  level: LeniencyMode;
+  result: TurnstileVerifyResponse;
+  durationMs: number;
+}
 
-    if (!token) {
-      return new Response('No Turnstile token provided', { status: 400 });
-    }
+function isLeniencyMode(value: unknown): value is LeniencyMode {
+  return value === "strict" || value === "relaxed" || value === "off";
+}
 
-    const mode = modeOverride || env.REMOTEIP_LENIENCY || 'strict';
-    
-    // Triple-call pattern: strict -> relaxed -> off (stops at first success)
-    const startTime1 = Date.now();
-    const strictResult = await verifyTurnstileToken(token, clientIp, env, 'strict');
-    const duration1 = Date.now() - startTime1;
-    
-    let relaxedResult = null;
-    let offResult = null;
-    let duration2 = 0;
-    let duration3 = 0;
-    let strictBlocked = false;
-    let relaxedBlocked = false;
-    let ipMismatchDetected = false;
+function isMismatchMode(value: unknown): value is MismatchMode {
+  return value === "none" || value === "subnet" || value === "asn";
+}
 
-    // If strict failed, try relaxed
-    if (!strictResult.success && strictResult["error-codes"].includes("invalid-input-response")) {
-      strictBlocked = true;
-      const startTime2 = Date.now();
-      relaxedResult = await verifyTurnstileToken(token, clientIp, env, 'relaxed');
-      duration2 = Date.now() - startTime2;
-      
-      // If relaxed also failed, try off
-      if (!relaxedResult.success && relaxedResult["error-codes"].includes("invalid-input-response")) {
-        relaxedBlocked = true;
-        const startTime3 = Date.now();
-        offResult = await verifyTurnstileToken(token, clientIp, env, 'off');
-        duration3 = Date.now() - startTime3;
-        
-        if (offResult.success) {
-          ipMismatchDetected = true; // Both strict and relaxed blocked, but token is valid
-        }
-      } else if (relaxedResult.success) {
-        ipMismatchDetected = true; // Strict blocked, relaxed passed
-      }
-    }
-    
-    // Determine final result
-    const verificationResult = strictResult.success ? strictResult : 
-                               (relaxedResult?.success ? relaxedResult : 
-                               (offResult?.success ? offResult : strictResult));
+function isMismatchAction(value: unknown): value is MismatchAction {
+  return value === "allow" || value === "block";
+}
 
-    // Handle IP mismatch detection (triple-call pattern revealed IP issue)
-    if (ipMismatchDetected) {
-      const shouldBlock = action === 'block';
-      const finalResult = relaxedResult?.success ? relaxedResult : offResult;
-      const warningHtml = `
+/** Canonical siteverify check: the token's action must match the widget's data-action. */
+function isActionAllowed(result: TurnstileVerifyResponse): boolean {
+  return result.action === EXPECTED_ACTION;
+}
+
+/** Comma-separated TURNSTILE_HOSTNAMES → allowlist set; null when unset (no enforcement). */
+function expectedHostnames(env: Env): Set<string> | null {
+  const raw = env.TURNSTILE_HOSTNAMES;
+  if (!raw) return null;
+  const list = raw
+    .split(",")
+    .map((hostname) => hostname.trim().toLowerCase())
+    .filter(Boolean);
+  return list.length > 0 ? new Set(list) : null;
+}
+
+/** Optional hostname allowlist enforcement (no-op when TURNSTILE_HOSTNAMES is unset). */
+function isHostnameAllowed(result: TurnstileVerifyResponse, env: Env): boolean {
+  const allowed = expectedHostnames(env);
+  if (!allowed) return true;
+  return result.hostname !== undefined && allowed.has(result.hostname.toLowerCase());
+}
+
+/** Enforcement levels to try, in order, starting at the configured level. */
+function enforcementSequence(start: LeniencyMode): LeniencyMode[] {
+  switch (start) {
+    case "strict":
+      return ["strict", "relaxed", "off"];
+    case "relaxed":
+      return ["relaxed", "off"];
+    case "off":
+      return ["off"];
+  }
+}
+
+const HTML_ENTITIES: Record<string, string> = {
+  "&": "&amp;",
+  "<": "&lt;",
+  ">": "&gt;",
+  '"': "&quot;",
+  "'": "&#39;",
+};
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (ch) => HTML_ENTITIES[ch]);
+}
+
+function isTurnstileVerifyResponse(value: unknown): value is TurnstileVerifyResponse {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.success === "boolean" &&
+    (record["error-codes"] === undefined || Array.isArray(record["error-codes"]))
+  );
+}
+
+export async function verifyTurnstileToken(
+  token: string,
+  clientIp: string | null,
+  env: Env,
+  leniencyMode?: LeniencyMode,
+): Promise<TurnstileVerifyResponse> {
+  const formData = new FormData();
+  formData.append("secret", env.TURNSTILE_SECRET);
+  formData.append("response", token);
+  formData.append("remoteip_leniency", leniencyMode ?? env.REMOTEIP_LENIENCY ?? "strict");
+  // remoteip is optional; omit it entirely when we don't know the client IP.
+  if (clientIp) formData.append("remoteip", clientIp);
+
+  const response = await fetch(SITEVERIFY_URL, {
+    body: formData,
+    method: "POST",
+    signal: AbortSignal.timeout(SITEVERIFY_TIMEOUT_MS),
+  });
+
+  if (!response.ok) {
+    throw new Error(`siteverify returned HTTP ${response.status}`);
+  }
+
+  const payload: unknown = await response.json();
+  if (!isTurnstileVerifyResponse(payload)) {
+    throw new Error("siteverify returned an unexpected payload");
+  }
+
+  return { ...payload, "error-codes": payload["error-codes"] ?? [] };
+}
+
+/**
+ * Simulates an IP mismatch between the real client IP and the IP sent to siteverify.
+ * IPv6 visitors are not supported by the same-subnet simulation; the real IP is sent
+ * unchanged and the mismatch description says so.
+ */
+function simulateIpMismatch(
+  realClientIp: string,
+  mismatchMode: MismatchMode,
+): { sentIp: string | null; mismatchDescription: string } {
+  if (mismatchMode === "none") {
+    return { sentIp: realClientIp || null, mismatchDescription: "" };
+  }
+  if (!realClientIp) {
+    return { sentIp: null, mismatchDescription: "no client IP available — no remoteip sent" };
+  }
+  if (mismatchMode === "asn") {
+    return { sentIp: ASN_MISMATCH_IP, mismatchDescription: "DIFFERENT ASN" };
+  }
+  if (realClientIp.includes(":")) {
+    return {
+      sentIp: realClientIp,
+      mismatchDescription: "IPv6 — same-subnet simulation unsupported, real IP sent",
+    };
+  }
+  const parts = realClientIp.split(".");
+  if (parts.length !== 4 || parts.some((part) => !/^\d+$/.test(part))) {
+    return { sentIp: realClientIp, mismatchDescription: "" };
+  }
+  const lastOctet = Number.parseInt(parts[3], 10);
+  const newOctet = lastOctet >= 255 ? 1 : lastOctet + 1;
+  return {
+    sentIp: `${parts[0]}.${parts[1]}.${parts[2]}.${newOctet}`,
+    mismatchDescription: "SAME SUBNET",
+  };
+}
+
+function textResponse(status: number, body: string): Response {
+  return new Response(body, {
+    status,
+    headers: {
+      "Content-Type": "text/plain; charset=utf-8",
+      "X-Content-Type-Options": "nosniff",
+      "Referrer-Policy": "no-referrer",
+    },
+  });
+}
+
+function htmlResponse(status: number, body: string, csp: string): Response {
+  return new Response(body, {
+    status,
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "X-Content-Type-Options": "nosniff",
+      "Referrer-Policy": "no-referrer",
+      "Content-Security-Policy": csp,
+    },
+  });
+}
+
+function ipLabel(ip: string | null): string {
+  return ip ? escapeHtml(ip) : "(not sent)";
+}
+
+function errorCodes(result: TurnstileVerifyResponse): string[] {
+  return result["error-codes"] ?? [];
+}
+
+function renderCallTimeline(calls: CallRecord[], token: string, sentIp: string | null): string {
+  return calls
+    .map((call, index) => {
+      const badge = call.result.success ? "success" : "fail";
+      const label = call.result.success ? "PASSED ✓" : "FAILED ✗";
+      const detail = call.result.success
+        ? `<span class="label">Note:</span> token consumed at this level ✓`
+        : `<span class="label">Error:</span> [${errorCodes(call.result)
+            .map(escapeHtml)
+            .join(", ")}]<br>
+            <span class="label">Note:</span> token NOT consumed (IP check failed before token store)`;
+      return `
+      <div class="call ${badge}">
+        <div class="call-header">
+          📞 Call #${index + 1}: siteverify with remoteip_leniency="${call.level}"
+          <span class="badge ${badge}">${label}</span>
+          <span class="muted">(${call.durationMs}ms)</span>
+        </div>
+        <div class="request">
+          POST ${SITEVERIFY_URL}<br>
+          secret: [REDACTED]<br>
+          response: ${escapeHtml(token.slice(0, 40))}${token.length > 40 ? "…" : ""}<br>
+          remoteip: ${ipLabel(sentIp)}<br>
+          <strong>remoteip_leniency: ${call.level}</strong>
+        </div>
+        <div class="call-detail">${detail}</div>
+      </div>`;
+    })
+    .join("\n");
+}
+
+function renderResponseDetails(calls: CallRecord[]): string {
+  const blocks = calls
+    .map(
+      (call, index) =>
+        `<h4>Call #${index + 1} (${call.level}) Response:</h4>
+         <pre>${escapeHtml(JSON.stringify(call.result, null, 2))}</pre>`,
+    )
+    .join("\n");
+  return `
+    <details>
+      <summary>View Full API Responses</summary>
+      ${blocks}
+    </details>`;
+}
+
+function mismatchClassification(calls: CallRecord[]): string {
+  const passed = calls.find((call) => call.result.success);
+  if (passed?.level === "relaxed") {
+    return `
+      • <strong>Strict-only mismatch</strong> (call passed at relaxed)<br>
+      • IP mismatch level: same ASN + same subnet, different exact IP
+        (or IPv4↔IPv6 cross-family on the same ASN, or a private/loopback IP)<br>
+      • Would be blocked by: strict only<br>
+      • Would pass: relaxed and off`;
+  }
+  return `
+      • <strong>Relaxed-level mismatch</strong> (call passed at off)<br>
+      • IP mismatch level: different ASN, or same ASN + different subnet (IPv4 /24, IPv6 /64)<br>
+      • Would be blocked by: strict and relaxed<br>
+      • Would pass: off only`;
+}
+
+interface PageContext {
+  token: string;
+  sentIp: string | null;
+  realClientIp: string;
+  mismatchDescription: string;
+}
+
+function renderSuccessPage(calls: CallRecord[], ctx: PageContext): string {
+  const first = calls[0];
+  return `
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Verification Success</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 700px; margin: 50px auto; padding: 20px; }
+    .success { border: 2px solid #28a745; padding: 20px; border-radius: 8px; background: #d4edda; }
+    .result { background: #f8f9fa; padding: 15px; margin: 15px 0; border-radius: 4px; font-family: monospace; font-size: 14px; }
+    .info { background: #e7f5ff; padding: 12px; margin: 15px 0; border-left: 4px solid #0066cc; font-size: 14px; }
+    h2 { color: #28a745; }
+    .label { font-weight: bold; }
+    .muted { color: #6c757d; font-size: 12px; font-weight: normal; }
+    .call { background: #fff; border-left: 4px solid #28a745; padding: 15px; margin: 15px 0; border-radius: 4px; }
+    .call-header { font-weight: bold; font-size: 16px; margin-bottom: 10px; }
+    .call-detail { font-family: monospace; font-size: 13px; margin: 5px 0; }
+    .request { background: #f8f9fa; padding: 10px; margin: 10px 0; border-radius: 4px; font-family: monospace; font-size: 12px; }
+    .badge { display: inline-block; padding: 3px 8px; border-radius: 3px; font-size: 12px; font-weight: bold; }
+    .badge.success { background: #28a745; color: white; }
+    pre { background: #2d2d2d; color: #f8f8f2; padding: 10px; border-radius: 4px; overflow-x: auto; font-size: 12px; }
+    summary { cursor: pointer; color: #0056b3; font-weight: bold; }
+    a { display: inline-block; margin-top: 20px; color: #0056b3; }
+  </style>
+</head>
+<body>
+  <div class="success">
+    <h2>✅ Turnstile Verification Successful</h2>
+
+    <div class="info">
+      <strong>No IP mismatch.</strong><br>
+      The first call passed at <code>remoteip_leniency="${first.level}"</code> — the IP matched the
+      starting enforcement level, so no fallback was needed (${calls.length} call${calls.length === 1 ? "" : "s"} made).
+    </div>
+
+    <div class="result">
+      <div><span class="label">Staged Result:</span> passed at ${first.level} (stopped at call #1)</div>
+      <div><span class="label">Duration:</span> ${first.durationMs}ms</div>
+      <div><span class="label">Real Client IP:</span> ${ctx.realClientIp ? escapeHtml(ctx.realClientIp) : "unknown"}</div>
+      <div><span class="label">IP Sent to Verify:</span> ${ipLabel(ctx.sentIp)}${ctx.mismatchDescription ? ` (${escapeHtml(ctx.mismatchDescription)})` : ""}</div>
+      <div><span class="label">Challenge TS:</span> ${escapeHtml(first.result.challenge_ts || "N/A")}</div>
+      <div><span class="label">Hostname:</span> ${escapeHtml(first.result.hostname || "N/A")}</div>
+    </div>
+
+    ${renderCallTimeline(calls, ctx.token, ctx.sentIp)}
+    ${renderResponseDetails(calls)}
+    <a href="/form">← Try again</a>
+  </div>
+</body>
+</html>`;
+}
+
+function renderMismatchPage(calls: CallRecord[], ctx: PageContext, action: MismatchAction): string {
+  const shouldBlock = action === "block";
+  const passedLevel = calls.find((call) => call.result.success)?.level ?? "off";
+  return `
 <!DOCTYPE html>
 <html>
 <head>
@@ -112,6 +363,7 @@ export async function handleTurnstileVerification(
     .call-header { font-weight: bold; font-size: 16px; margin-bottom: 10px; }
     .call-detail { font-family: monospace; font-size: 13px; margin: 5px 0; }
     .label { font-weight: bold; color: #555; }
+    .muted { color: #6c757d; font-size: 12px; font-weight: normal; }
     .badge { display: inline-block; padding: 3px 8px; border-radius: 3px; font-size: 12px; font-weight: bold; }
     .badge.fail { background: #dc3545; color: white; }
     .badge.success { background: #28a745; color: white; }
@@ -126,150 +378,98 @@ export async function handleTurnstileVerification(
 </head>
 <body>
   <div class="warning">
-    <h2>⚠️ IP Mismatch Detected (Triple-Call Pattern)</h2>
-    <p>The triple-call pattern successfully identified the IP mismatch level. Here's what happened:</p>
+    <h2>⚠️ IP Mismatch Detected (Staged Enforcement)</h2>
+    <p>The starting level blocked the token on IP grounds, but a looser level accepted it.
+       Here's the full call timeline:</p>
 
     <h3>Call Timeline</h3>
     <div class="timeline">
-      <div class="call">
-        <div class="call-header">
-          📞 Call #1: siteverify with remoteip_leniency="strict"
-          <span class="badge fail">FAILED</span>
-          <span style="color: #999; font-size: 12px; font-weight: normal;">(${duration1}ms)</span>
-        </div>
-        <div class="request">
-          POST https://challenges.cloudflare.com/turnstile/v0/siteverify<br>
-          secret: [REDACTED]<br>
-          response: ${token.substring(0, 40)}...<br>
-          remoteip: ${clientIp}<br>
-          <strong>remoteip_leniency: strict</strong>
-        </div>
-        <div class="call-detail">
-          <span class="label">Result:</span> success: false<br>
-          <span class="label">Error:</span> ["invalid-input-response"]<br>
-          <span class="label">Note:</span> Token NOT consumed (IP check failed before token store)
-        </div>
-      </div>
-
-      ${relaxedResult ? `
-      <div class="call ${relaxedResult.success ? 'success' : ''}">
-        <div class="call-header">
-          📞 Call #2: Retry with remoteip_leniency="relaxed"
-          <span class="badge ${relaxedResult.success ? 'success' : 'fail'}">${relaxedResult.success ? 'SUCCESS' : 'FAILED'}</span>
-          <span style="color: #999; font-size: 12px; font-weight: normal;">(${duration2}ms)</span>
-        </div>
-        <div class="request">
-          POST https://challenges.cloudflare.com/turnstile/v0/siteverify<br>
-          secret: [REDACTED]<br>
-          response: ${token.substring(0, 40)}... <em>(same token)</em><br>
-          remoteip: ${clientIp} <em>(same IP)</em><br>
-          <strong>remoteip_leniency: relaxed</strong>
-        </div>
-        <div class="call-detail">
-          <span class="label">Result:</span> success: ${relaxedResult.success}<br>
-          ${relaxedResult.success ? `
-            <span class="label">Challenge TS:</span> ${relaxedResult.challenge_ts || 'N/A'}<br>
-            <span class="label">Note:</span> Token consumed here ✓
-          ` : `
-            <span class="label">Error:</span> ["invalid-input-response"]<br>
-            <span class="label">Note:</span> Token still NOT consumed
-          `}
-        </div>
-      </div>
-      ` : ''}
-
-      ${offResult ? `
-      <div class="call success">
-        <div class="call-header">
-          📞 Call #3: Retry with remoteip_leniency="off"
-          <span class="badge success">SUCCESS</span>
-          <span style="color: #999; font-size: 12px; font-weight: normal;">(${duration3}ms)</span>
-        </div>
-        <div class="request">
-          POST https://challenges.cloudflare.com/turnstile/v0/siteverify<br>
-          secret: [REDACTED]<br>
-          response: ${token.substring(0, 40)}... <em>(same token)</em><br>
-          remoteip: ${clientIp} <em>(same IP)</em><br>
-          <strong>remoteip_leniency: off</strong>
-        </div>
-        <div class="call-detail">
-          <span class="label">Result:</span> success: true ✓<br>
-          <span class="label">Challenge TS:</span> ${offResult.challenge_ts || 'N/A'}<br>
-          <span class="label">Note:</span> Token consumed here ✓
-        </div>
-      </div>
-      ` : ''}
+      ${renderCallTimeline(calls, ctx.token, ctx.sentIp)}
     </div>
 
     <div class="conclusion">
       <strong>🔍 Conclusion:</strong><br>
-      ${relaxedResult?.success ? `
-        • <strong>2-call pattern: Strict blocked, relaxed passed</strong><br>
-        • IP mismatch level: Same ASN + same subnet, but different exact IP (or IPv4↔IPv6 cross-family, or private remote IP)<br>
-        • Real IP: ${realClientIp}<br>
-        • Sent IP: ${clientIp} ${mismatchDescription ? `(${mismatchDescription})` : ''}<br>
-        • Result: Cloudflare's ASN database considers these IPs in the same ASN + subnet<br>
-        • Would be blocked by: strict mode only<br>
-        • Would pass: relaxed and off modes
-      ` : offResult?.success ? `
-        • <strong>3-call pattern: Both strict AND relaxed blocked, only off passed</strong><br>
-        • IP mismatch level: Different ASN, or same ASN + different subnet (IPv4 /24, IPv6 /64)<br>
-        • Real IP: ${realClientIp}<br>
-        • Sent IP: ${clientIp} ${mismatchDescription ? `(${mismatchDescription})` : ''}<br>
-        ${mismatchDescription === 'SAME SUBNET' ? `• Note: Despite being in same /24, Cloudflare's ASN database treats these as different ASNs (fragmented IP block assignment)<br>` : ''}
-        • Would be blocked by: both strict and relaxed modes<br>
-        • Would pass: off mode only
-      ` : ''}
+      ${mismatchClassification(calls)}<br>
+      • Real IP: ${ctx.realClientIp ? escapeHtml(ctx.realClientIp) : "unknown"}<br>
+      • Sent IP: ${ipLabel(ctx.sentIp)}${ctx.mismatchDescription ? ` (${escapeHtml(ctx.mismatchDescription)})` : ""}<br>
+      • Token consumed at: <code>remoteip_leniency="${passedLevel}"</code>
     </div>
 
-    <h3>Action Taken: ${shouldBlock ? '🚫 Hard Block' : '✅ Allow + Flag'}</h3>
-    ${shouldBlock ? `
+    <h3>Action Taken: ${shouldBlock ? "🚫 Hard Block" : "✅ Allow + Flag"}</h3>
+    ${
+      shouldBlock
+        ? `
     <div style="background: #f8d7da; border-left: 4px solid #dc3545; padding: 15px; margin: 15px 0;">
       <strong>Request BLOCKED</strong><br>
       • IP mismatch detected → rejecting request (HTTP 401)<br>
-      • User sees immediate failure<br>
       • ⚠️ <strong>Attacker knows they were detected</strong><br>
-      • Use case: High-security scenarios where false positives are acceptable
+      • Use case: high-security scenarios where false positives are acceptable
     </div>
-    ` : `
+    `
+        : `
     <div style="background: #d4edda; border-left: 4px solid #28a745; padding: 15px; margin: 15px 0;">
       <strong>Request ALLOWED + FLAGGED</strong><br>
       • IP mismatch detected but allowing request (HTTP 200)<br>
       • Session/account flagged for review<br>
       • ✓ <strong>Attacker doesn't know they're being tracked</strong> (shadow ban)<br>
-      • Use case: Gather intel, avoid false positive friction
+      • Use case: gather intel, avoid false-positive friction
     </div>
-    `}
+    `
+    }
 
     <p><strong>Other options you could implement:</strong></p>
     <ul>
-      <li><strong>Step-Up Auth:</strong> Require MFA, email code, or CAPTCHA</li>
-      <li><strong>Rate Limit:</strong> Increase friction without blocking</li>
-      <li><strong>Conditional Block:</strong> Block based on risk score, user history, etc.</li>
+      <li><strong>Step-Up Auth:</strong> require MFA, email code, or another challenge</li>
+      <li><strong>Rate Limit:</strong> increase friction without blocking</li>
+      <li><strong>Conditional Block:</strong> decide on risk score, user history, etc.</li>
     </ul>
 
-    <details>
-      <summary>View Full API Responses</summary>
-      <h4>Call #1 (strict) Response:</h4>
-      <pre>${JSON.stringify(strictResult, null, 2)}</pre>
-      ${relaxedResult ? `<h4>Call #2 (relaxed) Response:</h4>
-      <pre>${JSON.stringify(relaxedResult, null, 2)}</pre>` : ''}
-      ${offResult ? `<h4>Call #3 (off) Response:</h4>
-      <pre>${JSON.stringify(offResult, null, 2)}</pre>` : ''}
-    </details>
-    
+    ${renderResponseDetails(calls)}
     <a href="/form">← Try again</a>
   </div>
 </body>
 </html>`;
-      return new Response(warningHtml, {
-        status: shouldBlock ? 401 : 200,
-        headers: { 'Content-Type': 'text/html; charset=utf-8' }
-      });
-    }
+}
 
-    if (!verificationResult.success) {
-      const errorHtml = `
+function renderFailurePage(
+  calls: CallRecord[],
+  ctx: PageContext,
+  syntheticCodes: string[] = [],
+): string {
+  const last = calls[calls.length - 1];
+  const lastResult = last.result;
+  const displayedCodes = [...errorCodes(lastResult), ...syntheticCodes];
+  const stagedSummary =
+    calls.length > 1
+      ? `
+    <div class="staged">
+      <strong>Staged Enforcement Result:</strong><br>
+      ${calls
+        .map(
+          (call, index) =>
+            `• Call #${index + 1} (${call.level}) → failed: [${errorCodes(call.result)
+              .map(escapeHtml)
+              .join(", ")}]`,
+        )
+        .join("<br>")}<br>
+      • <strong>Conclusion:</strong> token invalid for reasons other than IP
+        (expired, reused, malformed, rule-blocked, etc.)
+    </div>`
+      : "";
+  const gateSummary = syntheticCodes.length
+    ? `
+    <div class="staged">
+      <strong>Validation Gate:</strong><br>
+      • siteverify succeeded, but the canonical validation gate rejected the token:<br>
+      • ${syntheticCodes
+        .map((code) => `<code>${escapeHtml(code)}</code>`)
+        .join(
+          ", ",
+        )} — action must be <code>${EXPECTED_ACTION}</code>${syntheticCodes.includes("hostname-not-allowed") ? " and the hostname must be in the TURNSTILE_HOSTNAMES allowlist" : ""}<br>
+      • Request rejected (fail closed, HTTP 401)
+    </div>`
+    : "";
+  return `
 <!DOCTYPE html>
 <html>
 <head>
@@ -279,7 +479,10 @@ export async function handleTurnstileVerification(
     .error { border: 2px solid #dc3545; padding: 20px; border-radius: 8px; background: #f8d7da; }
     h2 { color: #dc3545; }
     .errors { background: #fff; padding: 10px; margin: 15px 0; border-radius: 4px; }
-    .tripleCall { background: #f8f9fa; padding: 10px; margin: 15px 0; border-left: 4px solid #dc3545; font-size: 14px; }
+    .staged { background: #f8f9fa; padding: 10px; margin: 15px 0; border-left: 4px solid #dc3545; font-size: 14px; }
+    pre { background: #fff; padding: 10px; margin-top: 10px; overflow-x: auto; }
+    details { margin-top: 15px; }
+    summary { cursor: pointer; color: #dc3545; }
     a { display: inline-block; margin-top: 20px; color: #0056b3; }
   </style>
 </head>
@@ -287,134 +490,116 @@ export async function handleTurnstileVerification(
   <div class="error">
     <h2>❌ Verification Failed</h2>
     <div class="errors">
-      <strong>Error codes:</strong> ${verificationResult["error-codes"].join(", ")}<br><br>
-      <strong>Real Client IP:</strong> ${realClientIp}<br>
-      <strong>IP Sent to Verify:</strong> ${clientIp}${mismatchDescription ? ` (${mismatchDescription})` : ''}
+      <strong>Error codes:</strong> ${displayedCodes.map(escapeHtml).join(", ")}<br><br>
+      <strong>Real Client IP:</strong> ${ctx.realClientIp ? escapeHtml(ctx.realClientIp) : "unknown"}<br>
+      <strong>IP Sent to Verify:</strong> ${ipLabel(ctx.sentIp)}${ctx.mismatchDescription ? ` (${escapeHtml(ctx.mismatchDescription)})` : ""}
     </div>
-    
-    ${offResult ? `
-    <div class="tripleCall">
-      <strong>Triple-Call Pattern Result:</strong><br>
-      • Call #1 (strict) → failed<br>
-      • Call #2 (relaxed) → failed<br>
-      • Call #3 (off) → failed<br>
-      • <strong>Conclusion:</strong> Token invalid for reasons other than IP (expired, reused, malformed, rule-blocked, etc.)
-    </div>
-    <details>
-      <summary style="cursor: pointer;">All API Responses</summary>
-      <h4>Call #1 (strict):</h4>
-      <pre style="background: #fff; padding: 10px; margin-top: 10px;">${JSON.stringify(strictResult, null, 2)}</pre>
-      <h4>Call #2 (relaxed):</h4>
-      <pre style="background: #fff; padding: 10px; margin-top: 10px;">${JSON.stringify(relaxedResult, null, 2)}</pre>
-      <h4>Call #3 (off):</h4>
-      <pre style="background: #fff; padding: 10px; margin-top: 10px;">${JSON.stringify(offResult, null, 2)}</pre>
-    </details>
-    ` : ''}
-
-    <details style="margin-top: 15px;">
-      <summary style="cursor: pointer; color: #dc3545;">API Response</summary>
-      <pre style="background: #fff; padding: 10px; margin-top: 10px; overflow-x: auto;">${JSON.stringify(strictResult, null, 2)}</pre>
-    </details>
+    ${stagedSummary}
+    ${gateSummary}
+    ${renderResponseDetails(calls)}
     <a href="/form">← Try again</a>
   </div>
 </body>
 </html>`;
-      return new Response(errorHtml, {
-        status: 401,
-        headers: { 'Content-Type': 'text/html; charset=utf-8' }
-      });
+}
+
+export async function handleTurnstileVerification(
+  request: Request,
+  env: Env,
+  modeOverride?: string | null,
+  mismatchOverride?: string | null,
+  actionOverride?: string | null,
+): Promise<Response> {
+  try {
+    const formData = await request.formData();
+    const tokenField = formData.get("cf-turnstile-response");
+    const token = typeof tokenField === "string" ? tokenField : "";
+
+    if (!token) {
+      return textResponse(400, "No Turnstile token provided");
+    }
+    if (token.length > MAX_TOKEN_LENGTH) {
+      return textResponse(400, "Turnstile token too long");
     }
 
-    const successHtml = `
-<!DOCTYPE html>
-<html>
-<head>
-  <title>Verification Success</title>
-  <style>
-    body { font-family: Arial, sans-serif; max-width: 700px; margin: 50px auto; padding: 20px; }
-    .success { border: 2px solid #28a745; padding: 20px; border-radius: 8px; background: #d4edda; }
-    .result { background: #f8f9fa; padding: 15px; margin: 15px 0; border-radius: 4px; font-family: monospace; font-size: 14px; }
-    .info { background: #e7f5ff; padding: 12px; margin: 15px 0; border-left: 4px solid #0066cc; font-size: 14px; }
-    h2 { color: #28a745; }
-    .label { font-weight: bold; }
-    a { display: inline-block; margin-top: 20px; color: #0056b3; }
-  </style>
-</head>
-<body>
-  <div class="success">
-    <h2>✅ Turnstile Verification Successful</h2>
-    
-    <div class="info">
-      <strong>Strict Mode Success</strong><br>
-      First call with <code>remoteip_leniency="strict"</code> succeeded immediately.<br>
-      No additional calls needed — IP matched exactly (strict is the most restrictive policy).
-    </div>
+    const realClientIp = request.headers.get("CF-Connecting-IP") ?? "";
+    const mismatchMode = isMismatchMode(mismatchOverride) ? mismatchOverride : "none";
+    const action = isMismatchAction(actionOverride) ? actionOverride : "allow";
+    const { sentIp, mismatchDescription } = simulateIpMismatch(realClientIp, mismatchMode);
 
-    <div class="result">
-      <div><span class="label">Triple-Call Result:</span> Passed strict (stopped at call #1)</div>
-      <div><span class="label">Duration:</span> ${duration1}ms</div>
-      <div><span class="label">Real Client IP:</span> ${realClientIp}</div>
-      <div><span class="label">IP Sent to Verify:</span> ${clientIp}${mismatchDescription ? ` (${mismatchDescription})` : ''}</div>
-      <div><span class="label">Challenge TS:</span> ${verificationResult.challenge_ts || 'N/A'}</div>
-      <div><span class="label">Hostname:</span> ${verificationResult.hostname || 'N/A'}</div>
-    </div>
-    <details>
-      <summary style="cursor: pointer; color: #0056b3;">Full API Response</summary>
-      <pre style="background: #fff; padding: 10px; overflow-x: auto;">${JSON.stringify(verificationResult, null, 2)}</pre>
-    </details>
-    <a href="/form">← Try again</a>
-  </div>
-</body>
-</html>`;
-    return new Response(successHtml, {
-      headers: { 'Content-Type': 'text/html; charset=utf-8' }
-    });
+    const startLevel = isLeniencyMode(modeOverride)
+      ? modeOverride
+      : (env.REMOTEIP_LENIENCY ?? "strict");
+
+    const calls: CallRecord[] = [];
+    for (const level of enforcementSequence(startLevel)) {
+      const startedAt = Date.now();
+      let result: TurnstileVerifyResponse;
+      try {
+        result = await verifyTurnstileToken(token, sentIp, env, level);
+      } catch (error) {
+        // Transport/HTTP/payload failure — fail closed with a synthetic error code.
+        // Structured log for Workers Logs; never log tokens or secrets.
+        console.error(
+          JSON.stringify({
+            event: "siteverify_call_failed",
+            level,
+            message: error instanceof Error ? error.message : String(error),
+          }),
+        );
+        result = { success: false, "error-codes": ["internal-error"] };
+      }
+      calls.push({ level, result, durationMs: Date.now() - startedAt });
+      if (result.success) break;
+      // Only keep falling back when the failure looks like an IP-policy block.
+      if (!errorCodes(result).includes("invalid-input-response")) break;
+    }
+
+    const ctx: PageContext = { token, sentIp, realClientIp, mismatchDescription };
+    const first = calls[0];
+    const passed = calls.find((call) => call.result.success);
+
+    // Canonical siteverify gate on the successful result: expected action + optional hostname allowlist.
+    let gateCode: string | null = null;
+    if (passed) {
+      if (!isActionAllowed(passed.result)) gateCode = "action-not-allowed";
+      else if (!isHostnameAllowed(passed.result, env)) gateCode = "hostname-not-allowed";
+    }
+
+    if (first.result.success && !gateCode) {
+      return htmlResponse(200, renderSuccessPage(calls, ctx), STATIC_PAGE_CSP);
+    }
+    if (passed && !gateCode) {
+      return htmlResponse(
+        action === "block" ? 401 : 200,
+        renderMismatchPage(calls, ctx, action),
+        STATIC_PAGE_CSP,
+      );
+    }
+    return htmlResponse(
+      401,
+      renderFailurePage(calls, ctx, gateCode ? [gateCode] : []),
+      STATIC_PAGE_CSP,
+    );
   } catch (error) {
-    return new Response(`Error: ${error instanceof Error ? error.message : String(error)}`, { status: 500 });
+    // Malformed form body or unexpected error — fail closed without leaking internals.
+    console.error(
+      JSON.stringify({
+        event: "handler_error",
+        message: error instanceof Error ? error.message : String(error),
+      }),
+    );
+    return textResponse(500, "Internal error");
   }
 }
 
-export async function verifyTurnstileToken(
-  token: string,
-  clientIp: string,
-  env: Env,
-  leniencyMode?: 'strict' | 'relaxed' | 'off'
-): Promise<TurnstileVerifyResponse> {
-  const formData = new FormData();
-  formData.append('secret', env.TURNSTILE_SECRET);
-  formData.append('response', token);
-  formData.append('remoteip', clientIp);
-
-  // Use environment variable if specified, otherwise default to strict
-  const leniency = leniencyMode || env.REMOTEIP_LENIENCY || 'strict';
-  formData.append('remoteip_leniency', leniency);
-
-  const response = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
-    body: formData,
-    method: 'POST'
-  });
-
-  return response.json();
-}
-
-export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url);
-
-    if (url.pathname === '/' && request.method === 'GET') {
-      const leniencyMode = env.REMOTEIP_LENIENCY || 'strict';
-      const indexHtml = `
-<!DOCTYPE html>
-<html>
-<head>
-  <title>Turnstile remoteip_leniency Demo</title>
-  <style>
+const BASE_STYLES = `
     body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; line-height: 1.6; }
     .container { border: 1px solid #ddd; padding: 30px; border-radius: 8px; }
     h1 { color: #0056b3; margin-bottom: 10px; }
     h2 { color: #333; margin-top: 30px; border-bottom: 2px solid #0056b3; padding-bottom: 5px; }
     h3 { color: #555; margin-top: 25px; }
-    .info { background: #f0f8ff; padding: 15px; margin: 20px 0; border-left: 4px solid #0056b3; }
+    .info { background: #f0f8ff; padding: 15px; margin: 20px 0; border-left: 4px solid #0066cc; }
     .btn { display: inline-block; background: #0056b3; color: white; padding: 12px 24px; text-decoration: none; border-radius: 4px; margin-top: 20px; }
     .btn:hover { background: #004494; }
     code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; font-family: monospace; color: #c7254e; }
@@ -422,40 +607,55 @@ export default {
     pre strong { color: #f92672; }
     ul { margin: 15px 0; }
     li { margin: 10px 0; }
+    table { border-collapse: collapse; margin: 15px 0; }
+    th, td { border: 1px solid #ddd; padding: 8px 12px; text-align: left; font-size: 14px; }
+    th { background: #f0f8ff; }
     em { color: #666; }
-  </style>
+`;
+
+function renderIndexPage(startLevel: LeniencyMode): string {
+  return `
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Turnstile remoteip_leniency Demo</title>
+  <style>${BASE_STYLES}</style>
 </head>
 <body>
   <div class="container">
     <h1>Turnstile remoteip_leniency Demo</h1>
     <div class="info">
-      <strong>Current Configuration:</strong> remoteip_leniency = "${leniencyMode}"
+      <strong>Current Configuration:</strong> starting enforcement level = "${startLevel}"
     </div>
     <h2>What is remoteip_leniency?</h2>
     <p>An <strong>undocumented parameter</strong> for Turnstile's <code>/siteverify</code> API that controls IP address validation strictness.</p>
-    
+
     <h3>The Three Modes</h3>
     <ul>
-      <li><code>off</code> (default) - <strong>No IP enforcement.</strong> Token validated on all other criteria only.</li>
-      <li><code>strict</code> - <strong>Exact IP match required.</strong> Rejects if remote IP ≠ token solve IP. Any mismatch = rejection.</li>
-      <li><code>relaxed</code> - <strong>Same ASN/subnet required.</strong> Rejects if different ASN, different subnet (IPv4 /24, IPv6 /64), or invalid IP. Allows same-ASN changes, IPv4↔IPv6 cross-family (same ASN), private/loopback IPs.</li>
+      <li><code>off</code> — <strong>No IP enforcement.</strong> Token validated on all other criteria only.</li>
+      <li><code>strict</code> — <strong>Exact IP match required.</strong> Rejects if the verifying IP ≠ token solve IP.</li>
+      <li><code>relaxed</code> — <strong>Same ASN/subnet required.</strong> Rejects on different ASN, different subnet (IPv4 /24, IPv6 /64), or invalid IP. Allows same-ASN changes, IPv4↔IPv6 cross-family (same ASN), private/loopback IPs.</li>
     </ul>
 
     <h3>The Problem: No IP Mismatch Signal</h3>
     <p>When <code>strict</code> or <code>relaxed</code> blocks a token due to IP mismatch, the response is:</p>
     <pre>{ "success": false, "error-codes": ["invalid-input-response"] }</pre>
-    <p>This is the <strong>same error code</strong> as expired tokens, reused tokens, malformed tokens. <strong>You can't tell if it was an IP mismatch or something else.</strong></p>
+    <p>This is the <strong>same error code</strong> as expired, reused, or malformed tokens. <strong>You can't tell IP mismatch from other failures.</strong></p>
 
-    <h3>The Double-Call Workaround</h3>
-    <p>Detect IP mismatches by calling siteverify twice:</p>
-    <pre>1. Call with remoteip_leniency: "strict" (or "relaxed")
-   → If success: true → allow (IP matched)
-   → If success: false:
+    <h3>The Workaround: Staged Enforcement</h3>
+    <p>Call siteverify with progressively looser IP enforcement using the <em>same</em> token. Tokens are consumed
+       only on successful validation, and failed IP checks don't consume them — so where the cascade stops tells you
+       exactly which levels would have blocked:</p>
+    <pre>1. Start at your chosen enforcement level (e.g. strict)
+   → success: true  → allow (IP matched at that level)
+   → success: false with "invalid-input-response":
 
-2. Retry SAME token with remoteip_leniency: "off"
-   → If success: true → IP mismatch detected! (flag/allow)
-   → If success: false → token invalid for other reason (reject)</pre>
-    <p><strong>Note:</strong> Tokens are consumed only on successful validation, so a failed strict call + successful off call works. This demo implements the double-call pattern.</p>
+2. Retry the SAME token at the next looser level (relaxed → off)
+   → success: true  → IP mismatch detected! The earlier level(s) would have blocked.
+   → success: false → token invalid for another reason (reject)</pre>
+    <p><strong>Production guidance:</strong> you normally only need <strong>two calls</strong> — your enforcement
+       level, then <code>off</code> as the diagnostic. The intermediate <code>relaxed</code> call only adds
+       classification granularity (same-subnet vs cross-ASN), which is this demo's purpose.</p>
 
     <h3>How to Use It</h3>
     <p>Add the parameter when calling Turnstile's siteverify endpoint:</p>
@@ -470,152 +670,111 @@ const result = await fetch(
   { method: 'POST', body: formData }
 );</pre>
 
-    <h3>Implementation Example: Double-Call Pattern</h3>
-    <p>This demo implements the recommended pattern for detecting IP mismatches:</p>
-    <pre>// Step 1: First call with strict/relaxed
-const result1 = await verifyTurnstile(token, visitorIP, "strict");
+    <h3>Decision Matrix (starting at strict)</h3>
+    <table>
+      <tr><th>Call #1 (strict)</th><th>Call #2 (relaxed)</th><th>Call #3 (off)</th><th>Meaning</th><th>Calls</th></tr>
+      <tr><td>✅ pass</td><td>—</td><td>—</td><td>Exact IP match</td><td>1</td></tr>
+      <tr><td>❌ fail</td><td>✅ pass</td><td>—</td><td>Same ASN + subnet, different IP</td><td>2</td></tr>
+      <tr><td>❌ fail</td><td>❌ fail</td><td>✅ pass</td><td>Different ASN or subnet</td><td>3</td></tr>
+      <tr><td>❌ fail</td><td>❌ fail</td><td>❌ fail</td><td>Token invalid (expired/reused/…)</td><td>3</td></tr>
+    </table>
+    <p><em>Starting at relaxed skips call #1 (relaxed → off); starting at off makes a single call.</em></p>
 
-if (result1.success) {
-  return { allow: true, ipMismatch: false };
-}
-
-// Step 2: If failed, check if it was IP mismatch
-if (result1["error-codes"].includes("invalid-input-response")) {
-  // Retry same token with enforcement OFF
-  const result2 = await verifyTurnstile(token, visitorIP, "off");
-  
-  if (result2.success) {
-    // First failed on IP, second succeeded without enforcement
-    return { 
-      allow: true,  // or false - your choice
-      ipMismatch: true,
-      flagForReview: true 
-    };
-  }
-}
-
-// Both calls failed - token invalid for other reason
-return { allow: false, error: result1["error-codes"] };</pre>
-
-    <p><strong>Why it works:</strong> Tokens are consumed only on successful validation. A failed strict call followed by a successful off call proves the failure was IP-related, not token expiry/reuse/etc.</p>
-
-    <h3>Example Scenarios</h3>
-    
-    <h4>Scenario A: Strict-Only Mismatch (2 calls)</h4>
-    <pre>User solves challenge from: 192.168.1.100 (Comcast, ASN 7922)
-User IP changes to:         192.168.1.200 (Comcast, ASN 7922)
-
-Call #1 (strict):  192.168.1.100 ≠ 192.168.1.200 → FAIL
-Call #2 (relaxed): Same ASN (7922) + same /24 → SUCCESS ✓
-
-Result: Strict blocked, relaxed passed (2 calls made)</pre>
-
-    <h4>Scenario B: Both Modes Block (3 calls)</h4>
-    <pre>User solves challenge from: 203.0.113.50 (ISP A, ASN 12345)
-User IP changes to:         8.8.8.8 (Google, ASN 15169)
-
-Call #1 (strict):  203.0.113.50 ≠ 8.8.8.8 → FAIL
-Call #2 (relaxed): ASN 12345 ≠ ASN 15169 → FAIL
-Call #3 (off):     (no IP check) → SUCCESS ✓
-
-Result: Both blocked (3 calls made)
-<strong>This demo simulates Scenario B using 8.8.8.8</strong></pre>
+    <h3>Key Behaviors</h3>
+    <ul>
+      <li>Failed IP checks <strong>don't consume the token</strong> (IP check happens before the token store).</li>
+      <li>The first successful call consumes the token.</li>
+      <li>Only <code>invalid-input-response</code> failures trigger fallback — non-IP errors stop the cascade.</li>
+      <li>⚠️ <code>remoteip_leniency</code> is <strong>undocumented</strong> and may change or disappear without notice.</li>
+    </ul>
 
     <a href="/form" class="btn">Try the Demo →</a>
   </div>
 </body>
 </html>`;
-      return new Response(indexHtml, {
-        headers: { 'Content-Type': 'text/html; charset=utf-8' }
-      });
-    }
+}
 
-    if (url.pathname === '/form' && request.method === 'GET') {
-      const mode = url.searchParams.get('mode') || env.REMOTEIP_LENIENCY || 'strict';
-      const mismatchType = url.searchParams.get('mismatch') || 'none'; // none, subnet, asn
-      const action = url.searchParams.get('action') || 'allow';
-      const formHtml = `
+function renderFormPage(
+  siteKey: string,
+  mode: LeniencyMode,
+  mismatch: MismatchMode,
+  action: MismatchAction,
+): string {
+  const subnetNote =
+    mismatch === "subnet"
+      ? `<div class="warning">
+          <strong>⚠️ Same Subnet Mismatch Mode</strong><br>
+          We'll send (last octet + 1) to siteverify instead of your real IP. Expected: the cascade stops
+          one level earlier if the IPs share the same ASN. IPv6 visitors: same-subnet simulation is
+          unsupported — your real IP is sent unchanged.
+        </div>`
+      : "";
+  const asnNote =
+    mismatch === "asn"
+      ? `<div class="warning" style="background: #ffe4e1;">
+          <strong>⚠️ Different ASN Mismatch Mode</strong><br>
+          Sending 8.8.8.8 (Google, ASN 15169) instead of your real IP. Expected: strict and relaxed both
+          fail, off passes.
+        </div>`
+      : "";
+  return `
 <!DOCTYPE html>
 <html>
 <head>
-  <title>Turnstile Demo - remoteip_leniency: ${mode}</title>
+  <title>Turnstile Demo — starting level: ${mode}</title>
   <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
   <style>
-    body { font-family: Arial, sans-serif; max-width: 600px; margin: 50px auto; padding: 20px; }
-    .container { border: 1px solid #ddd; padding: 20px; border-radius: 8px; }
+    ${BASE_STYLES}
     input[type="submit"] { background: #0056b3; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; }
     input[type="submit"]:hover { background: #004494; }
     .cf-turnstile { margin: 20px 0; }
-    .info { background: #f0f8ff; padding: 10px; margin-bottom: 20px; border-left: 4px solid #0056b3; }
     .warning { background: #fff3cd; padding: 10px; margin-bottom: 20px; border-left: 4px solid #ffc107; }
-    .mode-toggle { margin: 15px 0; padding: 10px; background: #fff; border: 1px solid #ddd; border-radius: 4px; }
-    .mode-toggle label { margin-right: 15px; cursor: pointer; }
-    .mode-toggle input[type="radio"] { margin-right: 5px; }
-    .test-toggle { margin: 15px 0; padding: 10px; background: #fff; border: 1px solid #ddd; border-radius: 4px; }
-    .test-toggle input[type="checkbox"] { margin-right: 5px; }
+    .toggle { margin: 15px 0; padding: 10px; background: #fff; border: 1px solid #ddd; border-radius: 4px; }
+    .toggle label { margin-right: 15px; cursor: pointer; display: inline-block; margin-top: 5px; }
+    .toggle input[type="radio"] { margin-right: 5px; }
   </style>
 </head>
 <body>
   <div class="container">
     <h2>Turnstile remoteip_leniency Demo</h2>
     <div class="info">
-      <strong>Current Mode:</strong> ${mode}<br>
-      <strong>Purpose:</strong> Test undocumented remoteip_leniency parameter in siteverify API
-    </div>
-    
-    <div class="mode-toggle">
-      <strong>Select Mode:</strong><br><br>
-      <label><input type="radio" name="mode" value="strict" ${mode === 'strict' ? 'checked' : ''} onchange="updateMode('strict')"> strict</label>
-      <label><input type="radio" name="mode" value="relaxed" ${mode === 'relaxed' ? 'checked' : ''} onchange="updateMode('relaxed')"> relaxed</label>
-      <label><input type="radio" name="mode" value="off" ${mode === 'off' ? 'checked' : ''} onchange="updateMode('off')"> off</label>
+      <strong>Starting enforcement level:</strong> ${mode}<br>
+      <strong>Purpose:</strong> test the undocumented remoteip_leniency parameter and observe staged fallback
     </div>
 
-    <div class="test-toggle">
+    <div class="toggle">
+      <strong>Starting Enforcement Level</strong> (first siteverify call; falls back to looser levels on IP failure):<br><br>
+      <label><input type="radio" name="mode" value="strict" ${mode === "strict" ? "checked" : ""} onchange="updateMode('strict')"> strict → relaxed → off (3 calls max)</label><br>
+      <label><input type="radio" name="mode" value="relaxed" ${mode === "relaxed" ? "checked" : ""} onchange="updateMode('relaxed')"> relaxed → off (2 calls max)</label><br>
+      <label><input type="radio" name="mode" value="off" ${mode === "off" ? "checked" : ""} onchange="updateMode('off')"> off only (1 call, no IP check)</label>
+    </div>
+
+    <div class="toggle">
       <strong>IP Mismatch Simulation:</strong><br><br>
-      <label><input type="radio" name="mismatch" value="none" ${mismatchType === 'none' ? 'checked' : ''} onchange="updateMismatch()"> No mismatch (send real IP)</label><br>
-      <label><input type="radio" name="mismatch" value="subnet" ${mismatchType === 'subnet' ? 'checked' : ''} onchange="updateMismatch()"> Same subnet (your IP + 1) → expect 2 calls (if same ASN)</label><br>
-      <label><input type="radio" name="mismatch" value="asn" ${mismatchType === 'asn' ? 'checked' : ''} onchange="updateMismatch()"> Different ASN (8.8.8.8) → expect 3 calls</label>
+      <label><input type="radio" name="mismatch" value="none" ${mismatch === "none" ? "checked" : ""} onchange="updateMismatch()"> No mismatch (send real IP)</label><br>
+      <label><input type="radio" name="mismatch" value="subnet" ${mismatch === "subnet" ? "checked" : ""} onchange="updateMismatch()"> Same subnet (your IP + 1)</label><br>
+      <label><input type="radio" name="mismatch" value="asn" ${mismatch === "asn" ? "checked" : ""} onchange="updateMismatch()"> Different ASN (8.8.8.8)</label>
     </div>
 
-    <div class="test-toggle">
+    <div class="toggle">
       <strong>Action on IP Mismatch Detection:</strong><br><br>
-      <label><input type="radio" name="action" value="allow" ${action === 'allow' ? 'checked' : ''} onchange="updateAction()"> Allow + Flag (shadow ban - attacker doesn't know)</label><br>
-      <label><input type="radio" name="action" value="block" ${action === 'block' ? 'checked' : ''} onchange="updateAction()"> Hard Block (reject - attacker knows immediately)</label>
+      <label><input type="radio" name="action" value="allow" ${action === "allow" ? "checked" : ""} onchange="updateAction()"> Allow + Flag (shadow ban — attacker doesn't know)</label><br>
+      <label><input type="radio" name="action" value="block" ${action === "block" ? "checked" : ""} onchange="updateAction()"> Hard Block (reject — attacker knows immediately)</label>
     </div>
 
-    ${mismatchType === 'subnet' ? `<div class="warning" style="background: #fff3cd;">
-      <strong>⚠️ Same Subnet Mismatch Mode</strong><br>
-      Your real IP will be shown below. We'll send (last octet + 1) to siteverify.<br><br>
-      <strong>Expected Result:</strong> 2 calls if IPs share same ASN<br>
-      • Call #1 (strict): FAIL - different exact IP<br>
-      • Call #2 (relaxed): SUCCESS ✓ - same /24 + same ASN<br><br>
-      <strong>If you see 3 calls:</strong> IP+1 is in a different ASN in Cloudflare's database (fragmented IP blocks). Try "Different ASN" option instead to see the 3-call pattern clearly.
-    </div>` : ''}
-    ${mismatchType === 'asn' ? `<div class="warning" style="background: #ffe4e1;">
-      <strong>⚠️ Different ASN Mismatch Mode</strong><br>
-      Sending 8.8.8.8 (Google DNS, ASN 15169) instead of your real IP.<br><br>
-      <strong>Expected Result:</strong> 3 calls (strict → relaxed → off)<br>
-      • Call #1 (strict): FAIL - different exact IP<br>
-      • Call #2 (relaxed): FAIL - different ASN from yours<br>
-      • Call #3 (off): SUCCESS - token is valid ✓
-    </div>` : ''}
+    ${subnetNote}
+    ${asnNote}
 
-    <div class="info" style="background: #e7f3ff; border-left-color: #0066cc; font-size: 14px;">
-      <strong>What happens when you submit (Triple-Call Pattern):</strong><br>
-      1️⃣ Call #1: siteverify with <code>remoteip_leniency="strict"</code><br>
-      2️⃣ If call #1 fails → Call #2 with <code>remoteip_leniency="relaxed"</code> (same token)<br>
-      3️⃣ If call #2 also fails → Call #3 with <code>remoteip_leniency="off"</code> (same token)<br>
-      <br>
-      <strong>Pattern stops at first success:</strong><br>
-      • Passed strict → no IP mismatch, no additional calls<br>
-      • Failed strict, passed relaxed → strict-only mismatch<br>
-      • Failed both, passed off → both strict + relaxed would block<br>
-      • All three failed → token invalid (expired/reused/malformed)
+    <div class="info" style="font-size: 14px;">
+      <strong>What happens when you submit:</strong><br>
+      Call #1 uses the selected level. If it fails with <code>invalid-input-response</code> (the IP-policy
+      error), the same token is retried at the next looser level. The cascade stops at the first success —
+      the page shows which levels would have blocked.
     </div>
 
     <p>Complete the challenge and submit:</p>
-    <form method="POST" action="/form?mode=${mode}&mismatch=${mismatchType}&action=${action}">
-      <div class="cf-turnstile" data-sitekey="${env.TURNSTILE_SITE_KEY}"></div>
+    <form method="POST" action="/form?mode=${mode}&mismatch=${mismatch}&action=${action}">
+      <div class="cf-turnstile" data-sitekey="${escapeHtml(siteKey)}" data-action="${EXPECTED_ACTION}"></div>
       <br>
       <input type="submit" value="Verify Token">
     </form>
@@ -625,34 +784,55 @@ Result: Both blocked (3 calls made)
       const mode = document.querySelector('input[name="mode"]:checked').value;
       const mismatch = document.querySelector('input[name="mismatch"]:checked').value;
       const action = document.querySelector('input[name="action"]:checked').value;
-      return '/form?mode=' + mode + '&mismatch=' + mismatch + '&action=' + action;
+      return '/form?mode=' + encodeURIComponent(mode) + '&mismatch=' + encodeURIComponent(mismatch) + '&action=' + encodeURIComponent(action);
     }
-    function updateMode(mode) {
-      location.href = buildUrl();
-    }
-    function updateMismatch() {
-      location.href = buildUrl();
-    }
-    function updateAction() {
-      location.href = buildUrl();
-    }
+    function updateMode() { location.href = buildUrl(); }
+    function updateMismatch() { location.href = buildUrl(); }
+    function updateAction() { location.href = buildUrl(); }
   </script>
 </body>
-</html>
-      `;
+</html>`;
+}
 
-      return new Response(formHtml, {
-        headers: { 'Content-Type': 'text/html; charset=utf-8' }
-      });
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+    const pathname = url.pathname;
+
+    if (pathname === "/" && (request.method === "GET" || request.method === "HEAD")) {
+      const startLevel = isLeniencyMode(env.REMOTEIP_LENIENCY) ? env.REMOTEIP_LENIENCY : "strict";
+      return htmlResponse(200, renderIndexPage(startLevel), STATIC_PAGE_CSP);
     }
 
-    if (request.method === 'POST') {
-      const mode = url.searchParams.get('mode') as 'strict' | 'relaxed' | 'off' | null;
-      const mismatchType = url.searchParams.get('mismatch') || 'none';
-      const action = url.searchParams.get('action') || 'allow';
-      return handleTurnstileVerification(request, env, mode, mismatchType, action);
+    if (pathname === "/form") {
+      if (request.method === "GET" || request.method === "HEAD") {
+        const defaultLevel = isLeniencyMode(env.REMOTEIP_LENIENCY)
+          ? env.REMOTEIP_LENIENCY
+          : "strict";
+        const requested = url.searchParams.get("mode");
+        const mismatchParam = url.searchParams.get("mismatch");
+        const actionParam = url.searchParams.get("action");
+        const mode = isLeniencyMode(requested) ? requested : defaultLevel;
+        const mismatch = isMismatchMode(mismatchParam) ? mismatchParam : "none";
+        const action = isMismatchAction(actionParam) ? actionParam : "allow";
+        return htmlResponse(
+          200,
+          renderFormPage(env.TURNSTILE_SITE_KEY, mode, mismatch, action),
+          FORM_PAGE_CSP,
+        );
+      }
+      if (request.method === "POST") {
+        return handleTurnstileVerification(
+          request,
+          env,
+          url.searchParams.get("mode"),
+          url.searchParams.get("mismatch"),
+          url.searchParams.get("action"),
+        );
+      }
+      return textResponse(405, "Method not allowed");
     }
 
-    return new Response('Method not allowed', { status: 405 });
-  }
+    return textResponse(404, "Not found");
+  },
 };

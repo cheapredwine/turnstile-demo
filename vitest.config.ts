@@ -3,8 +3,7 @@ import { resolve } from 'path';
 
 export default defineConfig({
   test: {
-    globals: true,
-    environment: 'jsdom',
+    environment: 'node',
     setupFiles: [],
     coverage: {
       provider: 'v8',

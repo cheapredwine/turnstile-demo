@@ -1,0 +1,4 @@
+# Copy this file to .dev.vars (gitignored) for local `wrangler dev` sessions.
+# Any non-empty value works locally — only POST /form calls siteverify, which will
+# reject it with invalid-input-secret (expected in dev without a real secret).
+TURNSTILE_SECRET=local-dev-placeholder

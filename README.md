@@ -1,84 +1,95 @@
 # Turnstile remoteip_leniency Demo
 
-Cloudflare Worker demonstrating the undocumented `remoteip_leniency` parameter in Turnstile's siteverify API.
+> ⚠️ **NOT OFFICIAL CLOUDFLARE.** Not affiliated with or endorsed by Cloudflare, Inc.
+> NO WARRANTIES, EXPRESS OR IMPLIED. Effectively untested demo code — read everything
+> and dry-run before you run. You assume all risk. See [DISCLAIMER.md](./DISCLAIMER.md).
 
-**Live Demo:** https://turnstile-demo.jsherron-test-account.workers.dev
+Cloudflare Worker demonstrating the undocumented `remoteip_leniency` parameter in Turnstile's siteverify API, using **staged enforcement** to classify IP mismatches.
+
+**Live Demo:** https://turnstile-demo.jsherron-test-account.workers.dev — protected by Cloudflare Access (authorized visitors only)
 
 ## What This Does
 
-Demonstrates Turnstile's undocumented `remoteip_leniency` parameter + **triple-call pattern** to determine exact IP mismatch level.
+Demonstrates Turnstile's undocumented `remoteip_leniency` parameter + a **staged fallback cascade** that determines the exact IP mismatch level.
 
-**Modes:**
-- `off` (default) - No IP enforcement
-- `strict` - Exact IP match required (any mismatch = reject)
-- `relaxed` - Same ASN/subnet required (rejects different ASN, different subnet IPv4 /24 or IPv6 /64)
+**Enforcement levels:**
+- `off` — no IP enforcement (token validated on all other criteria only)
+- `strict` — exact IP match required (any mismatch = reject)
+- `relaxed` — same ASN/subnet required (rejects different ASN, different subnet IPv4 /24 or IPv6 /64)
 
-**Problem:** When `strict`/`relaxed` blocks a token, error code is `invalid-input-response` (same as expired/reused tokens). Can't distinguish IP mismatch from other failures, or strict-level vs relaxed-level mismatch.
+**Problem:** when `strict`/`relaxed` blocks a token, the error code is `invalid-input-response` — the same code as expired/reused/malformed tokens. You can't tell an IP mismatch from another failure, or a strict-level mismatch from a relaxed-level one.
 
-**Solution:** Triple-call pattern (strict → relaxed → off):
-1. Call #1: `strict` → if succeeds, stop (no mismatch)
-2. Call #2: `relaxed` → if succeeds, strict-only mismatch detected
-3. Call #3: `off` → if succeeds, both strict + relaxed would block
-4. All failed → token invalid for other reason (expired/reused/malformed)
+**Solution — staged enforcement:** the configured `REMOTEIP_LENIENCY` is the **starting level**; on an IP-policy failure (`invalid-input-response`) the same token is retried at the next looser level:
 
-**Key insight:** Failed IP checks don't consume the token (IP check happens before token store). First successful call consumes it.
+1. Call at the starting level → success means no IP mismatch (stop)
+2. Fallback to the next looser level → success means the earlier level(s) would have blocked
+3. All levels failed → token invalid for other reasons (expired/reused/malformed)
+
+The cascade length depends on the starting level: `strict` → `strict, relaxed, off` (3 calls max), `relaxed` → `relaxed, off` (2 calls max), `off` → single call.
+
+**Key insight:** failed IP checks don't consume the token (the IP check happens before the token store); the first successful call consumes it. Only `invalid-input-response` failures trigger fallback — other errors (e.g. `timeout-or-duplicate`) stop the cascade immediately.
+
+> **Production guidance:** you normally need only **two calls** — your enforcement level, then `off` as the diagnostic. The intermediate `relaxed` call only adds classification granularity (same-subnet vs cross-ASN). Note `remoteip_leniency` is **undocumented** and may change or disappear without notice.
 
 ## Quick Start
 
 ```bash
 npm install
-npm test           # Run 19 tests
-npm run deploy     # Deploy to Workers
+npm test           # Run 44 tests
+npm run check      # wrangler types --check + tsc --noEmit
+npm run lint       # oxlint
+npm run format     # oxfmt
+npm run dev        # Local dev server (copy .dev.vars.example to .dev.vars first)
+npm run deploy     # Deploy to Workers (wrangler deploy)
 ```
 
 ## Configuration
 
-**wrangler.toml:**
-```toml
-TURNSTILE_SITE_KEY = "0x4AAAAAAEX-IyAE9Fs2oLZ0"  # Public key
-REMOTEIP_LENIENCY = "strict"                      # Test mode
+**wrangler.jsonc:**
+```jsonc
+"vars": {
+  "TURNSTILE_SITE_KEY": "0x4AAAAAAEX-IyAE9Fs2oLZ0",  // Public key
+  "REMOTEIP_LENIENCY": "strict",                     // Starting enforcement level
+  "TURNSTILE_HOSTNAMES": "turnstile-demo.jsherron-test-account.workers.dev, jsherron.com, localhost, 127.0.0.1"
+}
 ```
+
+Also configured: `nodejs_compat` flag, `[observability]` with `head_sampling_rate: 1`, compatibility date tracking the pinned workerd.
 
 **Secret (via wrangler):**
 ```bash
 wrangler secret put TURNSTILE_SECRET
 ```
 
+Local dev secret: copy `.dev.vars.example` to `.dev.vars` (gitignored).
+
 ## Project Structure
 
 ```
-src/index.ts              # Worker + siteverify integration
-tests/turnstile.test.ts   # 19 tests covering all modes
-wrangler.toml             # Worker config
+src/index.ts               # Worker, siteverify integration, staged enforcement, canonical gate
+tests/turnstile.test.ts    # 44 tests covering all modes, fallbacks, and gates
+wrangler.jsonc             # Worker config
 ```
+
+## Endpoints
+
+**GET /** — project overview + current starting level
+**GET /form** — Turnstile widget (managed mode) with selectors for starting level, IP-mismatch simulation, and mismatch action
+**POST /form** — validates the token via staged enforcement, returns an HTML result page
 
 ## How It Works
 
-1. Widget at `/form` (managed mode, 3 selectable modes + IP mismatch simulator)
-2. Form POST submits cf-turnstile-response token
-3. Worker calls siteverify with selected `remoteip_leniency`
-4. If first call fails with `invalid-input-response` → retry with `off` (double-call pattern)
-5. Response shows:
-   - Success (first call passed)
-   - IP Mismatch Detected (first failed, second passed)
-   - Hard Failure (both failed - token expired/reused/malformed)
+1. Widget at `/form` (managed mode, `data-action="form"`); the form posts `cf-turnstile-response` plus the selected options
+2. Worker calls siteverify starting at the selected `remoteip_leniency` level
+3. If a call fails with `invalid-input-response` → retry the same token at the next looser level
+4. **Canonical gate on the successful result:** the token's `action` must equal the widget's `data-action` (`form`), and if `TURNSTILE_HOSTNAMES` is set, siteverify's `hostname` must be in the allowlist — otherwise the request fails closed (401)
+5. Response pages show:
+   - **Success** — passed at the starting level + gate, no IP mismatch
+   - **IP Mismatch Detected** — a later, looser level passed; the page classifies the mismatch level (strict-only vs relaxed-level) and applies the selected action (allow+flag → 200, hard block → 401)
+   - **Verification Failed** — all levels failed, or the gate rejected the token (expired/reused/malformed/action/hostname)
+6. Query params are allowlist-validated server-side (`strict|relaxed|off`, `none|subnet|asn`, `allow|block`); invalid values fall back to defaults — nothing user-supplied is echoed unescaped
 
-### Run Tests in Watch Mode
-```bash
-npm run test:watch
-```
-
-### Test Coverage
-
-The test suite validates:
-
-1. **Parameter Passing**: Verifies `remoteip_leniency` is correctly passed to Turnstile API
-2. **All Three Modes**: Tests "strict", "relaxed", and "off" modes
-## Endpoints
-
-**GET /** - Project overview + config info  
-**GET /form** - Turnstile widget  
-**POST /form** - Validates token, returns HTML with result
+**IP mismatch simulation:** `mismatch=subnet` sends the client IP with the last IPv4 octet incremented (same-subnet test; unsupported for IPv6 visitors — the real IP is sent and the page says so); `mismatch=asn` sends `8.8.8.8` (different-ASN test).
 
 ## Widget Domain Config
 
@@ -91,11 +102,11 @@ wrangler turnstile widget update 0x4AAAAAAEX-IyAE9Fs2oLZ0 \
   --domain "turnstile-demo.jsherron-test-account.workers.dev"
 ```
 
-## Testing Different Modes
+## Testing Different Starting Levels
 
-Edit `wrangler.toml`:
-```toml
-REMOTEIP_LENIENCY = "relaxed"  # or "off"
+Edit `wrangler.jsonc`:
+```jsonc
+"REMOTEIP_LENIENCY": "relaxed"  // or "off"
 ```
 
 Then redeploy:
@@ -103,26 +114,27 @@ Then redeploy:
 npm run deploy
 ```
 
+Or use the level selector on `/form` (query param, no redeploy needed).
+
 ## Implementation Details
 
-**siteverify call (src/index.ts:64):**
+**siteverify call (src/index.ts, `verifyTurnstileToken`):**
 ```typescript
-formData.append('remoteip_leniency', leniency);
+formData.append('remoteip_leniency', leniencyMode ?? env.REMOTEIP_LENIENCY ?? 'strict');
+// remoteip is omitted entirely when the client IP is unknown
 ```
 
-**Test coverage:** 19 tests verify:
-- Parameter is sent correctly
-- All three modes work
-- Defaults to "strict"
-- Handles errors properly
+The call is hardened per the canonical pattern: token length ≤ 2048 enforced upstream, 10s `AbortSignal.timeout`, `response.ok` + payload shape validation, fail-closed on any transport/HTTP/payload error (synthetic `internal-error` code, logged as structured JSON without tokens), widget `data-action="form"` validated against siteverify's `action`, and optional `TURNSTILE_HOSTNAMES` hostname allowlist enforcement.
+
+**Test coverage (44 tests):** parameter passing, all three levels, env default, missing IP, non-2xx/non-JSON fail-closed, oversized tokens, non-IP errors stopping the cascade, missing `error-codes`, starting-level semantics (strict/relaxed/off), full fallback cascades, allow/block actions, action/hostname gate checks, IPv4 subnet + ASN + IPv6 simulation, HTML escaping (XSS regressions), hostile query-param sanitization, and worker routing (404s).
 
 ## Troubleshooting
 
-**Widget shows "unable to connect":** Domain not whitelisted. Add it via `wrangler turnstile widget update`.
+**Widget shows "unable to connect":** domain not whitelisted. Add it via `wrangler turnstile widget update`.
 
-**Token validation fails:** Check `wrangler secret list` shows `TURNSTILE_SECRET`.
+**Token validation fails:** check `wrangler secret list` shows `TURNSTILE_SECRET`.
 
-**Tests fail:** Run `npm install` then `npm test`.
+**Typecheck fails:** run `npm install`, then `npm run check`.
 
 ## Resources
 

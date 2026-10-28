@@ -1,27 +1,23 @@
 {
   "name": "turnstile-demo",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
-  "directories": {
-    "test": "tests"
-  },
+  "description": "Cloudflare Worker demo of Turnstile siteverify remoteip_leniency with staged IP-enforcement fallback",
+  "type": "module",
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "types": "wrangler types",
+    "check": "wrangler types --check && tsc --noEmit",
+    "lint": "oxlint src tests",
+    "format": "oxfmt src tests"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs",
+  "license": "MIT",
   "devDependencies": {
-    "@cloudflare/workers-types": "^5.20260821.1",
-    "@types/jest": "^30.0.0",
-    "jest": "^30.4.2",
-    "jsdom": "^30.0.1",
-    "ts-jest": "^29.4.12",
+    "oxfmt": "^0.75.0",
+    "oxlint": "^1.90.0",
+    "typescript": "^7.0.2",
     "vitest": "^4.1.11",
     "wrangler": "^4.125.0"
   }

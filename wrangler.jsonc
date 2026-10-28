@@ -1,0 +1,33 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "turnstile-demo",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+
+  "vars": {
+    // Turnstile site key (public) - configured for:
+    // - turnstile-demo.jsherron-test-account.workers.dev
+    // - jsherron.com, localhost, 127.0.0.1
+    "TURNSTILE_SITE_KEY": "0x4AAAAAAEX-IyAE9Fs2oLZ0",
+
+    // remoteip_leniency - undocumented parameter for the siteverify API.
+    // Sets the STARTING enforcement level for the staged fallback cascade:
+    //   "strict"  -> strict, then relaxed, then off (3 calls max)
+    //   "relaxed" -> relaxed, then off (2 calls max)
+    //   "off"     -> off only (single call, no IP check)
+    "REMOTEIP_LENIENCY": "strict",
+
+    // Optional siteverify hostname allowlist (mirrors the widget's domain whitelist).
+    // If you fork this demo into a real production backend, drop localhost/127.0.0.1.
+    "TURNSTILE_HOSTNAMES": "turnstile-demo.jsherron-test-account.workers.dev, jsherron.com, localhost, 127.0.0.1"
+  }
+
+  // Note: TURNSTILE_SECRET is stored via `wrangler secret put TURNSTILE_SECRET`.
+  // For local `wrangler dev`, copy .dev.vars.example to .dev.vars.
+}
