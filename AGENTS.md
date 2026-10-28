@@ -40,7 +40,7 @@ POST /form     → Token validation via staged enforcement
 - Secret: `TURNSTILE_SECRET` via wrangler secrets; local dev via `.dev.vars` (see `.dev.vars.example`)
 - `nodejs_compat` flag, `[observability] enabled` with `head_sampling_rate: 1`, compatibility_date 2026-10-01
 
-**Zone integration (jsherron.com, zone id [removed])**
+**Zone integration (jsherron.com)**
 - Precursor config via `PUT /zones/{zone_id}/precursor` (legacy shape — the portal tool
   wrapper cannot send the `Cloudflare-Version: 1.0` header, so `mode`/`rules`/`show_interstitial`
   are rejected; use legacy `default_mode` ∈ off|min-friction|max-security and
@@ -147,5 +147,5 @@ Hostile values are never echoed — invalid params fall back to defaults (XSS re
 
 **Status:** production-ready demo, 44/44 tests passing, typecheck + lint clean
 **Last Updated:** 2026-10-28
-**Account:** JSherron Test Account ([removed])
-**Zone:** jsherron.com ([removed]) — Precursor live per plan rollback doc
+**Account:** JSherron Test Account
+**Zone:** jsherron.com — Precursor live per plan rollback doc
