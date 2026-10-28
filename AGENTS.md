@@ -146,6 +146,7 @@ Hostile values are never echoed — invalid params fall back to defaults (XSS re
 ---
 
 **Status:** production-ready demo, 44/44 tests passing, typecheck + lint clean
+**Manual acceptance:** step-by-step browser walkthrough lives in the README ("Manual Browser Testing Walkthrough")
 **Last Updated:** 2026-10-28
 **Account:** JSherron Test Account
 **Zone:** jsherron.com — Precursor live per plan rollback doc

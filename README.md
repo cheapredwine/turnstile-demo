@@ -143,6 +143,23 @@ npm run deploy
 
 Or use the level selector on `/form` (query param, no redeploy needed).
 
+## Manual Browser Testing Walkthrough
+
+Acceptance steps for the live demo. Both hostnames are behind Cloudflare Access, so sign in first. For cleanest results test on the direct path (WARP disconnected) — inspection proxies can alter IP/hostname behavior.
+
+1. **Baseline pass** — open `https://turnstile-demo.jsherron.com/` → pass the Access login → on the first session-less visit you may see the **Precursor interstitial** ("Just a moment"); solve it → the overview page → **Try the Demo →** → complete the widget → **Verify Token** → expect **"✅ Verification Successful"**, 1 call, `strict`, no IP mismatch.
+2. **Replay rejection** — browser-back to the form and re-submit the same token → expect **"❌ Verification Failed"** with `timeout-or-duplicate` (tokens are single-use at siteverify).
+3. **Starting-level selector** — on `/form` pick **relaxed** and submit → first siteverify call uses `relaxed` (the page shows the level and call count). Pick **off** → single call, no IP check.
+4. **IP-mismatch simulations** —
+   - **Same subnet** → expect "⚠️ IP Mismatch Detected", 2 calls from a strict start (strict fails, relaxed passes)
+   - **Different ASN** (8.8.8.8) → expect 3 calls (strict + relaxed fail, off passes)
+   - **Action = block** → HTTP 401 "Request BLOCKED"; **allow** → HTTP 200 "Request ALLOWED + FLAGGED"
+5. **Hostname gate** — the `TURNSTILE_HOSTNAMES` allowlist covers both hostnames; a token solved on any other host would render `hostname-not-allowed` (401).
+6. **Second hostname** — repeat step 1 on `https://turnstile-demo.jsherron-test-account.workers.dev/` (Access-gated, same widget whitelist).
+7. **Cloudflare-side observation** — zone → **Security → Analytics → Traffic → Bot analysis** shows Precursor detections; **Workers Logs** (`wrangler tail`) shows structured `siteverify_call_failed` events on transport errors.
+
+Expected pass criterion: steps 1–4 produce the described pages with the described call counts; any deviation is a bug (compare against the committed baseline).
+
 ## Implementation Details
 
 **siteverify call (src/index.ts, `verifyTurnstileToken`):**
